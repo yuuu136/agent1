@@ -1,4 +1,13 @@
+fastapi
+uvicorn
 python-dotenv
 openai
 pydantic
 pytest
+PyYAML
+httpx
+streamlit
+streamlit-js-eval
+caldav
+langgraph
+chromadb

@@ -1,0 +1,66 @@
+service:
+  name: movie-ticket-agent
+  version: 0.1.0
+  description: 电影票智能体服务，负责意图识别、槽位提取、任务规划、RAG 检索和业务工具调用。
+
+server:
+  host: 0.0.0.0
+  port: 8001
+  cors_allow_origins:
+    - "*"
+
+llm:
+  provider: qwen-max
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  chat_model_name: qwen-max
+  temperature: 0.3
+  max_tokens: 1200
+  timeout_seconds: 60
+
+agent:
+  default_state: idle
+  enable_auto_skip: true
+  enable_memory: true
+  enable_rag: true
+  low_confidence_threshold: 0.45
+  high_confidence_threshold: 0.75
+  default_city: ""
+  default_ticket_count: 2
+  default_seat_preference: middle
+
+spring_boot:
+  base_url: http://localhost:8080
+  internal_token_env: SPRING_INTERNAL_TOKEN
+  timeout_seconds: 15
+  endpoints:
+    search_movies: /internal/movies/search
+    search_cinemas: /internal/cinemas/search
+    search_showtimes: /internal/showtimes/search
+    get_seats: /internal/showtimes/{showtime_id}/seats
+    lock_seats: /internal/seats/lock
+    create_order: /internal/orders
+    pay_order: /internal/orders/{order_id}/pay
+    get_order: /internal/orders/{order_id}
+    get_user_preferences: /internal/users/{user_id}/preferences
+
+mcp:
+  amap:
+    base_url: https://restapi.amap.com
+    key_env: AMAP_WEB_SERVICE_KEY
+    timeout_seconds: 15
+  calendar:
+    provider: local_ics
+    events_path: data/calendar/events.json
+    ics_dir: data/calendar/ics
+    timezone: Asia/Shanghai
+    server_url: https://caldav.icloud.com/
+    username_env: APPLE_CALDAV_USERNAME
+    app_password_env: APPLE_CALDAV_APP_PASSWORD
+    calendar_name_env: APPLE_CALDAV_CALENDAR_NAME
+    base_url:
+    token_env: CALENDAR_MCP_TOKEN
+    timeout_seconds: 15
+  notification:
+    provider: local_sms_outbox
+    outbox_path: data/notifications/sms_outbox.json

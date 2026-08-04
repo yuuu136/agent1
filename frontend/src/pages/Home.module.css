@@ -1,0 +1,178 @@
+.hero {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 0 18px 14px;
+  min-height: 164px;
+  padding: 18px;
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(13, 21, 34, 0.1), rgba(13, 21, 34, 0.82)),
+    url('https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=800&q=80') center/cover;
+  color: #ffffff;
+}
+
+.hero h1 {
+  margin: 8px 0;
+  font-size: 28px;
+  line-height: 1.1;
+}
+
+.hero p {
+  margin: 0;
+  color: #e6edf7;
+  line-height: 1.4;
+}
+
+.hero button,
+.ticketPanel button {
+  height: 40px;
+  border: 0;
+  border-radius: 8px;
+  background: #1267ff;
+  color: #ffffff;
+  font-weight: 800;
+  padding: 0 14px;
+  white-space: nowrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.2);
+  font-size: 12px;
+}
+
+.section {
+  margin: 0 18px 14px;
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.titleRow h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.titleRow span {
+  color: #738095;
+  font-size: 12px;
+}
+
+.movieRail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.movieCard,
+.showtime {
+  min-width: 0;
+  text-align: left;
+  border: 1px solid #dfe7f0;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.movieCard {
+  padding: 8px;
+}
+
+.poster {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  display: grid;
+  place-items: center;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  background:
+    linear-gradient(160deg, rgba(18, 103, 255, 0.78), rgba(23, 32, 51, 0.88)),
+    #172033;
+  color: #ffffff;
+  font-weight: 800;
+}
+
+.movieCard strong,
+.movieCard span,
+.showtime strong,
+.showtime span,
+.showtime em {
+  display: block;
+}
+
+.movieCard strong {
+  font-size: 14px;
+}
+
+.movieCard span {
+  margin-top: 4px;
+  color: #6f7b8e;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.selected {
+  border-color: #1267ff;
+  box-shadow: 0 0 0 1px #1267ff inset;
+}
+
+.showtimeList {
+  display: grid;
+  gap: 8px;
+}
+
+.showtime {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 3px 12px;
+  padding: 12px;
+}
+
+.showtime strong {
+  grid-row: span 2;
+  font-size: 20px;
+  align-self: center;
+}
+
+.showtime span {
+  color: #263247;
+  font-weight: 700;
+}
+
+.showtime em {
+  color: #6c788b;
+  font-style: normal;
+  font-size: 12px;
+}
+
+.ticketPanel {
+  margin: 12px 18px;
+  padding: 14px;
+  border: 1px solid #dfe7f0;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.ticketPanel p {
+  margin: 8px 0;
+  color: #445066;
+  line-height: 1.45;
+}
+
+.codeBox {
+  padding: 12px;
+  border: 1px dashed #1267ff;
+  border-radius: 8px;
+  background: #eef5ff;
+  color: #1267ff;
+  font-weight: 800;
+  word-break: break-word;
+}

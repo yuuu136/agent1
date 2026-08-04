@@ -1,0 +1,75 @@
+prompts:
+  system:
+    path: prompts/agent/system.md
+    description: 系统角色与行为边界
+    required_variables: []
+
+  greeting:
+    path: prompts/agent/greeting.md
+    description: 动态开场问候
+    required_variables:
+      - current_time
+      - time_greeting
+      - session_is_new
+
+  planner:
+    path: prompts/agent/planner.md
+    description: 任务规划和自动跳步
+    required_variables:
+      - intent
+      - slots
+      - current_state
+
+  policy:
+    path: prompts/agent/policy.md
+    description: 推荐和异常处理
+    required_variables:
+      - user_request
+      - tool_result
+
+  card:
+    path: prompts/agent/card.md
+    description: 动态卡片输出
+    required_variables:
+      - response_data
+
+  extract_slots:
+    path: prompts/nlu/extract_slots.md
+    description: 意图识别和槽位提取
+    required_variables:
+      - user_text
+
+  resolve_reference:
+    path: prompts/nlu/resolve_reference.md
+    description: 上下文指代消解
+    required_variables:
+      - user_text
+      - conversation_context
+
+  rag_answer:
+    path: prompts/rag/answer_with_context.md
+    description: 基于知识库回答问题
+    required_variables:
+      - user_query
+      - retrieved_context
+
+  tool_calling:
+    path: prompts/tools/tool_calling.md
+    description: 工具调用约束
+    required_variables:
+      - tool_name
+      - tool_schema
+
+  snack_recommend:
+    path: prompts/snack/snack_recommend.md
+    description: 零食和套餐推荐
+    required_variables:
+      - user_count
+      - snack_list
+
+  coupon_recommend:
+    path: prompts/coupon/coupon_recommend.md
+    description: 团购券和优惠券推荐
+    required_variables:
+      - order_info
+      - coupon_list

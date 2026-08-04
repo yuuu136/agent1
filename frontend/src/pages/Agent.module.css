@@ -1,0 +1,176 @@
+.welcome {
+  margin: 0 18px 14px;
+  padding: 16px;
+  border: 1px solid #dfe7f0;
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(18, 103, 255, 0.1), rgba(23, 32, 51, 0.05)),
+    #ffffff;
+}
+
+.welcome span {
+  color: #1267ff;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.welcome h1 {
+  margin: 8px 0;
+  font-size: 24px;
+}
+
+.welcome p {
+  margin: 0;
+  color: #647287;
+  line-height: 1.45;
+}
+
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.suggestions button {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid #bfd3ee;
+  border-radius: 999px;
+  background: #eef5ff;
+  color: #1267ff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chat {
+  padding: 0 18px 96px;
+}
+
+.message {
+  margin-bottom: 14px;
+}
+
+.user {
+  text-align: right;
+}
+
+.bubble {
+  display: inline-block;
+  max-width: 88%;
+  padding: 10px 12px;
+  border-radius: 8px;
+  line-height: 1.55;
+  text-align: left;
+  word-break: break-word;
+}
+
+.assistant .bubble {
+  border: 1px solid #dfe7f0;
+  background: #ffffff;
+}
+
+.user .bubble {
+  background: #1267ff;
+  color: #ffffff;
+}
+
+.loading {
+  color: #647287;
+}
+
+.cards {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.agentCard {
+  padding: 12px;
+  border: 1px solid #dfe7f0;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.cardTop {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cardTop span {
+  color: #1267ff;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.agentCard p {
+  margin: 8px 0;
+  color: #59677b;
+  line-height: 1.4;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.meta em {
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: #f0f4f8;
+  color: #647287;
+  font-style: normal;
+  font-size: 12px;
+}
+
+.actions {
+  margin-top: 12px;
+}
+
+.actions button {
+  height: 34px;
+  border: 0;
+  border-radius: 8px;
+  background: #172033;
+  color: #ffffff;
+  font-weight: 800;
+  padding: 0 12px;
+}
+
+.composer {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 54px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  padding: 10px 18px;
+  border-top: 1px solid #dfe7f0;
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.composer input {
+  height: 40px;
+  min-width: 0;
+  border: 1px solid #d5deea;
+  border-radius: 8px;
+  padding: 0 12px;
+  outline: none;
+}
+
+.composer button {
+  width: 64px;
+  border: 0;
+  border-radius: 8px;
+  background: #172033;
+  color: #ffffff;
+  font-weight: 800;
+}
+
+.composer button:disabled {
+  background: #c7d0dc;
+}

@@ -1,0 +1,10 @@
+chroma:
+  persist_directory: data/vector_store/chroma
+  collection_name: movie_ticket_agent_knowledge
+  distance_metric: cosine
+  reset_before_build: true
+
+metadata:
+  source_type: markdown
+  project: movie-ticket-agent
+  language: zh-CN

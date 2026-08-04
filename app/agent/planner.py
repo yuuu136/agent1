@@ -1,0 +1,232 @@
+from typing import Any
+
+from app.schemas.agent import AgentPlan, AgentState, NLUResult
+
+
+class TaskPlanner:
+    def plan(self, state: AgentState, nlu: NLUResult) -> AgentPlan:
+        slots = {**state.slots, **nlu.slots}
+
+        if nlu.intent == "faq":
+            return AgentPlan(
+                action="answer_with_rag",
+                reason="规则、FAQ 或稳定知识问题走 RAG",
+                params={"query": state.last_user_text},
+                state="answering",
+            )
+
+        if nlu.intent == "cancel":
+            return AgentPlan(
+                action="cancel",
+                reason="用户取消当前购票流程",
+                state="idle",
+            )
+
+        if nlu.intent == "price_query":
+            return AgentPlan(
+                action="answer_price",
+                reason="用户询问当前场次的票价，只读已有选座上下文",
+                params=self._pick(
+                    slots,
+                    [
+                        "showtimeId",
+                        "price",
+                        "ticketCount",
+                        "movieName",
+                        "cinemaName",
+                        "date",
+                        "time",
+                        "hallName",
+                        "startAt",
+                    ],
+                ),
+                state=state.state or "selecting_showtime",
+            )
+
+        if nlu.intent == "search_movies":
+            return AgentPlan(
+                action="search_movies",
+                reason="用户请求查看影片列表",
+                params=self._pick(state.slots, ["genre", "city"]),
+                state="selecting_movie",
+            )
+
+        if nlu.intent == "select_snacks":
+            return AgentPlan(
+                action="confirm_selection",
+                reason="用户已选择零食",
+                params=self._pick(slots, ["snackIds"]),
+                state="selecting_snacks",
+            )
+
+        if nlu.intent == "select_coupon":
+            return AgentPlan(
+                action="confirm_selection",
+                reason="用户已选择优惠券",
+                params=self._pick(slots, ["couponId"]),
+                state="selecting_coupon",
+            )
+
+        if nlu.intent == "nearby_cinema":
+            return AgentPlan(
+                action="search_nearby_cinemas",
+                reason="用户询问附近影院，根据当前位置查询票务数据库中的影院",
+                params=self._pick(slots, ["location", "city", "movieName", "genre"]),
+                state="selecting_cinema",
+            )
+
+        if slots.get("changeCinema"):
+            return AgentPlan(
+                action="search_nearby_cinemas",
+                reason="用户要求更换影院，重新查询票务数据库中的附近影院",
+                params=self._pick(slots, ["location", "city", "movieName", "genre"]),
+                state="selecting_cinema",
+            )
+
+        if nlu.intent == "snack":
+            return AgentPlan(
+                action="recommend_snacks",
+                reason="用户有零食需求，调用零食 MCP",
+                params=self._pick(slots, ["ticketCount", "snackIds"]),
+                state="selecting_snacks",
+            )
+
+        if nlu.intent == "coupon":
+            return AgentPlan(
+                action="recommend_coupons",
+                reason="用户有优惠需求，调用优惠券 MCP",
+                params=self._pick(slots, ["orderId", "ticketCount", "couponId"]),
+                state="selecting_coupon",
+            )
+
+        if nlu.intent == "pay_order":
+            if not slots.get("orderId"):
+                if not slots.get("lockId"):
+                    return AgentPlan(
+                        action="confirm_selection",
+                        reason="没有可支付订单，需要先选择场次和座位",
+                        params=slots,
+                        state="confirming",
+                    )
+                return AgentPlan(
+                    action="create_order",
+                    reason="支付前需要先有订单",
+                    params=self._pick(slots, ["showtimeId", "seatIds", "snackIds", "couponId"]),
+                    state="creating_order",
+                )
+            return AgentPlan(
+                action="pay_order",
+                reason="用户确认支付",
+                params=self._pick(slots, ["orderId"]),
+                state="paying",
+            )
+
+        if nlu.intent == "confirm_order":
+            if slots.get("showtimeId") and slots.get("seatIds"):
+                return AgentPlan(
+                    action="lock_seats",
+                    reason="用户确认场次和座位，先锁座",
+                    params=self._pick(slots, ["showtimeId", "seatIds", "ticketCount"]),
+                    state="locking_seats",
+                )
+            if slots.get("showtimeId"):
+                return AgentPlan(
+                    action="get_seats",
+                    reason="用户确认座位但还没有座位 ID，返回座位图继续选择",
+                    params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference"]),
+                    state="selecting_seats",
+                )
+            return AgentPlan(
+                action="confirm_selection",
+                reason="确认当前选择",
+                params=slots,
+                state="confirming",
+            )
+
+        if (
+            nlu.intent in {"select_showtime", "seat_query"}
+            or (
+                slots.get("showtimeId")
+                and "showtimeId" in nlu.slots
+                and not nlu.is_modification
+            )
+        ):
+            return AgentPlan(
+                action="get_seats",
+                reason="用户选择了场次，查询座位图",
+                params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference"]),
+                state="selecting_seats",
+            )
+
+        if nlu.intent in {"book_ticket", "select_or_modify"}:
+            missing_plan = self._plan_missing_required_slots(slots)
+            if missing_plan:
+                return missing_plan
+
+            if slots.get("movieName") or slots.get("genre"):
+                return AgentPlan(
+                    action="search_showtimes",
+                    reason="已有电影或类型、时间和票数，查询场次",
+                    params=self._pick(
+                        slots,
+                        [
+                            "movieName",
+                            "genre",
+                            "date",
+                            "timeRange",
+                            "ticketCount",
+                            "city",
+                            "cinemaId",
+                            "cinemaName",
+                            "hallType",
+                            "pricePreference",
+                            "timePreference",
+                        ],
+                    ),
+                    state="selecting_showtime",
+                )
+
+            return AgentPlan(
+                action="search_movies",
+                reason="购票流程先查电影",
+                params=self._pick(slots, ["genre", "city"]),
+                state="selecting_movie",
+            )
+
+        if nlu.intent == "seat_query" or slots.get("showtimeId"):
+            return AgentPlan(
+                action="get_seats",
+                reason="已有场次或用户询问座位，查询座位图",
+                params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference"]),
+                state="selecting_seats",
+            )
+
+        return AgentPlan(
+            action="smalltalk",
+            reason="没有识别到明确任务",
+            params={"query": state.last_user_text},
+            state="idle",
+        )
+
+    def _plan_missing_required_slots(self, slots: dict[str, Any]) -> AgentPlan | None:
+        if not slots.get("movieName") and not slots.get("genre"):
+            return AgentPlan(
+                action="ask_movie_or_genre",
+                reason="缺电影或类型",
+                state="collecting_movie",
+            )
+        if not slots.get("date") and not slots.get("timeRange"):
+            return AgentPlan(action="ask_time", reason="缺观影时间", state="collecting_time")
+        if not slots.get("ticketCount"):
+            return AgentPlan(
+                action="ask_ticket_count",
+                reason="缺购票数量",
+                state="collecting_ticket_count",
+            )
+        return None
+
+    def _pick(self, source: dict[str, Any], keys: list[str]) -> dict[str, Any]:
+        return {key: source[key] for key in keys if key in source and source[key] not in [None, ""]}
+
+
+task_planner = TaskPlanner()

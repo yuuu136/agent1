@@ -1,0 +1,36 @@
+rag:
+  enabled: true
+  knowledge_dir: data/knowledge
+  allowed_extensions:
+    - .md
+    - .txt
+  chunk_size: 800
+  chunk_overlap: 120
+  top_k: 5
+  score_threshold: 0.2
+
+embedding:
+  provider: qwen
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  embedding_model_name: text-embedding-v4
+  batch_size: 10
+  timeout_seconds: 60
+
+retrieval_policy:
+  use_rag_for:
+    - 业务规则解释
+    - 退改签说明
+    - 影院服务 FAQ
+    - 推荐理由
+    - 异常处理话术
+    - Agent 工作流说明
+    - 动态卡片协议
+  never_use_rag_for:
+    - 实时座位库存
+    - 锁座结果
+    - 下单结果
+    - 支付状态
+    - 出票状态
+    - 用户真实订单
+    - 用户隐私信息
