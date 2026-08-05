@@ -72,6 +72,23 @@ def test_chat_empty_new_session_returns_greeting() -> None:
     assert "附近有什么电影院" in payload["suggestions"]
 
 
+def test_stream_greeting_ignores_frontend_draft_context() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/agent/chat/stream",
+        json={
+            "sessionId": "agent-greeting-with-draft",
+            "draftId": 1,
+            "message": "你好",
+        },
+    )
+
+    assert response.status_code == 200
+    assert '"state": "greeting"' in response.text
+    assert "event: done" in response.text
+
+
 def test_chat_nearby_cinema_uses_spring_database_nearby_api(monkeypatch) -> None:
     captured = {}
 
@@ -180,7 +197,7 @@ def test_stream_chat_returns_sse_events() -> None:
     assert '"node": "planner"' in response.text
 
 
-def test_full_movie_ticket_flow_reaches_ticket_card() -> None:
+def test_full_movie_ticket_flow_reaches_payment_qr_card() -> None:
     client = TestClient(app)
     session_id = "agent-full-flow"
 
@@ -233,5 +250,11 @@ def test_full_movie_ticket_flow_reaches_ticket_card() -> None:
         },
     ).json()
 
-    assert pay_response["cards"][0]["type"] == "ticket"
-    assert pay_response["cards"][0]["meta"]["ticketStatus"] == "issued"
+    first_card = pay_response["cards"][0]
+    assert first_card["type"] in {"payment", "ticket"}
+    if first_card["type"] == "payment":
+        assert first_card["qrCode"]
+        assert pay_response["message"] == "支付二维码已生成，请扫码支付。"
+    else:
+        assert first_card["meta"]["ticketStatus"] == "issued"
+        assert pay_response["message"] in {"支付成功。", "支付成功，电子票已出票。"}

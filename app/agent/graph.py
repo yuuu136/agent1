@@ -65,7 +65,18 @@ def reference_node(data: AgentGraphState) -> dict[str, Any]:
 def planner_node(data: AgentGraphState) -> dict[str, Any]:
     plan = task_planner.plan(data["state"], data["nlu"])
     jwt = data["request"].jwt
-    if plan.action in {"search_nearby_cinemas", "search_movies", "search_showtimes", "get_seats"} and jwt:
+    if plan.action in {
+        "search_nearby_cinemas",
+        "search_movies",
+        "search_showtimes",
+        "get_seats",
+        "lock_seats",
+        "create_order",
+        "pay_order",
+        "issue_ticket",
+        "get_order",
+        "list_orders",
+    } and jwt:
         plan.params["jwt"] = jwt
     return {
         "plan": plan,

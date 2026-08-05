@@ -1,10 +1,13 @@
 from typing import Any
+from datetime import datetime
 
 from app.schemas.agent import AgentPlan, ToolResult
 
 
 class CardBuilder:
     def build(self, plan: AgentPlan, result: ToolResult) -> list[dict[str, Any]]:
+        if result.data.get("paymentReady"):
+            return self.payment_cards(result.data)
         if result.data.get("navigation"):
             return [self.navigation_card(result.data["navigation"])]
         if plan.action == "search_movies":
@@ -153,22 +156,28 @@ class CardBuilder:
                 "type": "confirm_order",
                 "id": data.get("orderId") or data.get("lockId") or "confirm",
                 "title": "确认订单",
+                "subtitle": self._order_subtitle(data),
+                "meta": self._order_meta(data),
                 "payload": data,
                 "actions": [{"event": "confirm_order", "label": "确认并继续"}],
             }
         ]
 
     def payment_cards(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        qr_code = data.get("qrCode")
         return [
             {
                 "type": "payment",
                 "id": data.get("orderId") or "payment",
-                "title": "模拟支付",
-                "meta": {
-                    "orderId": data.get("orderId"),
-                    "status": data.get("status"),
-                },
-                "actions": [{"event": "pay_order", "label": "确认支付"}],
+                "title": "确认支付",
+                "subtitle": self._order_subtitle(data),
+                "meta": self._order_meta(data),
+                "qrCode": qr_code,
+                "payload": data,
+                "actions": [{
+                    "event": "pay_order",
+                    "label": "去支付宝付款",
+                }],
             }
         ]
 
@@ -186,6 +195,82 @@ class CardBuilder:
                 },
             }
         ]
+
+    def _order_meta(self, data: dict[str, Any]) -> dict[str, Any]:
+        start_at = data.get("startAt")
+        end_at = data.get("endAt")
+        seats = self._seat_summary(data)
+        meta = {
+            "订单号": data.get("orderNo") or data.get("orderId"),
+            "电影": data.get("movieName"),
+            "影院": data.get("cinemaName"),
+            "影厅": data.get("hallName"),
+            "厅型": data.get("hallType"),
+            "语言": data.get("language"),
+            "日期": self._format_date(start_at) or data.get("date"),
+            "开始": self._format_time(start_at) or data.get("time"),
+            "结束": self._format_time(end_at),
+            "座位": seats,
+            "应付": self._format_amount(data.get("amount")),
+            "状态": data.get("statusDesc") or data.get("status"),
+        }
+        return {key: value for key, value in meta.items() if value not in [None, ""]}
+
+    def _order_subtitle(self, data: dict[str, Any]) -> str:
+        parts = [
+            data.get("movieName"),
+            data.get("cinemaName"),
+            data.get("hallName"),
+            self._format_time(data.get("startAt")) or data.get("time"),
+        ]
+        return " · ".join(str(part) for part in parts if part)
+
+    def _seat_summary(self, data: dict[str, Any]) -> str:
+        seats = data.get("seats") or data.get("seatIds") or []
+        if not isinstance(seats, list):
+            return str(seats) if seats else ""
+        labels = []
+        for seat in seats:
+            if isinstance(seat, dict):
+                row = seat.get("rowNo") or seat.get("row")
+                number = seat.get("seatNo") or seat.get("number")
+                if row not in [None, ""] and number not in [None, ""]:
+                    labels.append(f"{row}排{number}座")
+                    continue
+                if seat.get("seatId"):
+                    labels.append(str(seat["seatId"]))
+                    continue
+            elif seat not in [None, ""]:
+                labels.append(str(seat))
+        return "、".join(labels)
+
+    def _format_amount(self, value: Any) -> str:
+        if value in [None, ""]:
+            return ""
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        formatted = str(int(amount)) if amount.is_integer() else f"{amount:.2f}".rstrip("0").rstrip(".")
+        return f"{formatted}元"
+
+    def _format_date(self, value: Any) -> str:
+        parsed = self._parse_datetime(value)
+        return parsed.strftime("%Y-%m-%d") if parsed else ""
+
+    def _format_time(self, value: Any) -> str:
+        parsed = self._parse_datetime(value)
+        return parsed.strftime("%H:%M") if parsed else ""
+
+    def _parse_datetime(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
 
 
 card_builder = CardBuilder()

@@ -22,6 +22,30 @@ class TaskPlanner:
                 state="idle",
             )
 
+        if nlu.intent == "smalltalk":
+            return AgentPlan(
+                action="smalltalk",
+                reason="问候或闲聊不应继承旧购票流程",
+                params={"query": state.last_user_text},
+                state="idle",
+            )
+
+        if nlu.intent == "skip_snacks":
+            return AgentPlan(
+                action="confirm_selection",
+                reason="用户明确跳过零食",
+                params={"skipSnacks": True},
+                state=self._resume_after_optional_skip(slots, state.state),
+            )
+
+        if nlu.intent == "skip_coupon":
+            return AgentPlan(
+                action="confirm_selection",
+                reason="用户明确跳过优惠券",
+                params={"skipCoupon": True},
+                state=self._resume_after_optional_skip(slots, state.state),
+            )
+
         if nlu.intent == "price_query":
             return AgentPlan(
                 action="answer_price",
@@ -47,7 +71,10 @@ class TaskPlanner:
             return AgentPlan(
                 action="search_movies",
                 reason="用户请求查看影片列表",
-                params=self._pick(state.slots, ["genre", "city"]),
+                params=self._pick(
+                    slots,
+                    ["genre", "city", "cinemaId", "cinemaName", "date", "hallType"],
+                ),
                 state="selecting_movie",
             )
 
@@ -81,6 +108,35 @@ class TaskPlanner:
                 reason="用户要求更换影院，重新查询票务数据库中的附近影院",
                 params=self._pick(slots, ["location", "city", "movieName", "genre"]),
                 state="selecting_cinema",
+            )
+
+        if slots.get("changeShowtime") and not (
+            slots.get("showtimeId") and "showtimeId" in nlu.slots
+        ):
+            missing_plan = self._plan_missing_required_slots(slots)
+            if missing_plan:
+                return missing_plan
+            return AgentPlan(
+                action="search_showtimes",
+                reason="用户要求更换场次，保留电影和时间条件重新查询",
+                params=self._pick(
+                    slots,
+                    [
+                        "movieName",
+                        "genre",
+                        "date",
+                        "timeRange",
+                        "ticketCount",
+                        "city",
+                        "cinemaId",
+                        "cinemaName",
+                        "hallType",
+                        "pricePreference",
+                        "timePreference",
+                        "seatPositions",
+                    ],
+                ),
+                state="selecting_showtime",
             )
 
         if nlu.intent == "snack":
@@ -122,11 +178,36 @@ class TaskPlanner:
             )
 
         if nlu.intent == "confirm_order":
+            if slots.get("orderId"):
+                return AgentPlan(
+                    action="pay_order",
+                    reason="订单已经创建，确认后进入支付",
+                    params=self._pick(slots, ["orderId"]),
+                    state="paying",
+                )
             if slots.get("showtimeId") and slots.get("seatIds"):
                 return AgentPlan(
                     action="lock_seats",
                     reason="用户确认场次和座位，先锁座",
-                    params=self._pick(slots, ["showtimeId", "seatIds", "ticketCount"]),
+                    params=self._pick(
+                        slots,
+                        [
+                            "showtimeId",
+                            "seatIds",
+                            "ticketCount",
+                            "movieId",
+                            "movieName",
+                            "cinemaId",
+                            "cinemaName",
+                            "hallName",
+                            "hallType",
+                            "language",
+                            "date",
+                            "time",
+                            "startAt",
+                            "endAt",
+                        ],
+                    ),
                     state="locking_seats",
                 )
             if slots.get("showtimeId"):
@@ -148,13 +229,15 @@ class TaskPlanner:
             or (
                 slots.get("showtimeId")
                 and "showtimeId" in nlu.slots
-                and not nlu.is_modification
             )
         ):
             return AgentPlan(
                 action="get_seats",
                 reason="用户选择了场次，查询座位图",
-                params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference"]),
+                params=self._pick(
+                    slots,
+                    ["showtimeId", "ticketCount", "seatPreference", "seatPositions"],
+                ),
                 state="selecting_seats",
             )
 
@@ -163,13 +246,14 @@ class TaskPlanner:
             if missing_plan:
                 return missing_plan
 
-            if slots.get("movieName") or slots.get("genre"):
+            if slots.get("movieId") or slots.get("movieName") or slots.get("genre"):
                 return AgentPlan(
                     action="search_showtimes",
                     reason="已有电影或类型、时间和票数，查询场次",
                     params=self._pick(
                         slots,
                         [
+                            "movieId",
                             "movieName",
                             "genre",
                             "date",
@@ -181,6 +265,7 @@ class TaskPlanner:
                             "hallType",
                             "pricePreference",
                             "timePreference",
+                            "seatPositions",
                         ],
                     ),
                     state="selecting_showtime",
@@ -189,7 +274,10 @@ class TaskPlanner:
             return AgentPlan(
                 action="search_movies",
                 reason="购票流程先查电影",
-                params=self._pick(slots, ["genre", "city"]),
+                params=self._pick(
+                    slots,
+                    ["genre", "city", "cinemaId", "cinemaName", "date", "hallType"],
+                ),
                 state="selecting_movie",
             )
 
@@ -197,7 +285,10 @@ class TaskPlanner:
             return AgentPlan(
                 action="get_seats",
                 reason="已有场次或用户询问座位，查询座位图",
-                params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference"]),
+                params=self._pick(
+                    slots,
+                    ["showtimeId", "ticketCount", "seatPreference", "seatPositions"],
+                ),
                 state="selecting_seats",
             )
 
@@ -209,13 +300,21 @@ class TaskPlanner:
         )
 
     def _plan_missing_required_slots(self, slots: dict[str, Any]) -> AgentPlan | None:
-        if not slots.get("movieName") and not slots.get("genre"):
+        if (
+            not slots.get("movieId")
+            and not slots.get("movieName")
+            and not slots.get("genre")
+        ):
             return AgentPlan(
                 action="ask_movie_or_genre",
                 reason="缺电影或类型",
                 state="collecting_movie",
             )
-        if not slots.get("date") and not slots.get("timeRange"):
+        if (
+            not slots.get("date")
+            and not slots.get("timeRange")
+            and slots.get("timePreference") != "any"
+        ):
             return AgentPlan(action="ask_time", reason="缺观影时间", state="collecting_time")
         if not slots.get("ticketCount"):
             return AgentPlan(
@@ -227,6 +326,19 @@ class TaskPlanner:
 
     def _pick(self, source: dict[str, Any], keys: list[str]) -> dict[str, Any]:
         return {key: source[key] for key in keys if key in source and source[key] not in [None, ""]}
+
+    def _resume_after_optional_skip(
+        self,
+        slots: dict[str, Any],
+        current_state: str,
+    ) -> str:
+        if slots.get("orderId"):
+            return "paying"
+        if slots.get("showtimeId") and slots.get("seatIds"):
+            return "confirming"
+        if slots.get("showtimeId"):
+            return "selecting_seats"
+        return current_state or "idle"
 
 
 task_planner = TaskPlanner()

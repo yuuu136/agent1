@@ -212,6 +212,7 @@ class LocalMovieTicketMCP:
             or ""
         ).strip().casefold()
         genre = self._normalize_genre(arguments.get("genre"))
+        cinema_id = arguments.get("cinemaId")
         movies = [
             deepcopy(movie)
             for movie in self.movies
@@ -224,9 +225,20 @@ class LocalMovieTicketMCP:
                 or genre in movie["genre"].casefold()
             )
         ]
+        if cinema_id:
+            cinema_movie_ids = {
+                showtime["movieId"]
+                for showtime in self.showtimes
+                if showtime.get("cinemaId") == cinema_id
+            }
+            movies = [
+                movie
+                for movie in movies
+                if movie.get("movieId") in cinema_movie_ids
+            ]
         return ToolResult(
             tool_name="movie_ticket.search_movies",
-            data={"movies": movies},
+            data={"movies": movies, "cinemaId": cinema_id},
             message=f"已找到 {len(movies)} 部符合条件的电影。",
         )
 
@@ -604,6 +616,12 @@ class SpringBootMovieTicketMCP:
             "search_movies": self.search_movies,
             "search_showtimes": self.search_showtimes,
             "get_seats": self.get_seats,
+            "lock_seats": self.lock_seats,
+            "create_order": self.create_order,
+            "pay_order": self.pay_order,
+            "issue_ticket": self.issue_ticket,
+            "get_order": self.get_order,
+            "list_orders": self.list_orders,
         }
         handler = handlers.get(tool_name)
         if not handler:
@@ -615,15 +633,63 @@ class SpringBootMovieTicketMCP:
         try:
             return handler(arguments)
         except (httpx.HTTPError, ValueError) as exc:
+            error_text = str(exc)
+            if "未登录" in error_text or "Token" in error_text or "token" in error_text:
+                return ToolResult(
+                    tool_name=f"spring_boot.{tool_name}",
+                    success=False,
+                    data={"error": "AUTH_REQUIRED"},
+                    message="登录状态已失效，请重新登录后再查询电影票。",
+                )
+            if isinstance(exc, httpx.RequestError):
+                message = "票务数据库暂时无法连接，请确认 Spring Boot 服务已启动。"
+            elif error_text:
+                message = error_text
+            else:
+                message = "票务数据库查询失败，请确认 Spring Boot 服务和登录状态正常。"
             return ToolResult(
                 tool_name=f"spring_boot.{tool_name}",
                 success=False,
-                data={"error": str(exc)},
-                message="票务数据库查询失败，请确认 Spring Boot 服务和登录状态正常。",
+                data={"error": error_text},
+                message=message,
             )
 
     def search_movies(self, arguments: dict[str, Any]) -> ToolResult:
         keyword = arguments.get("movieName") or arguments.get("keyword")
+        cinema_id = arguments.get("cinemaId")
+        if cinema_id:
+            data = self._get_business(
+                "/api/user/showtimes",
+                arguments,
+                {
+                    "cinemaId": cinema_id,
+                    "date": self._spring_date(arguments.get("date")),
+                    "hallType": arguments.get("hallType"),
+                },
+            )
+            movies = self._format_showtime_movies(data, arguments)
+            movies = self._filter_movies(
+                movies,
+                keyword,
+                arguments.get("genre"),
+            )
+            cinema = data.get("cinema") or {}
+            cinema_name = (
+                cinema.get("name")
+                or arguments.get("cinemaName")
+                or "当前影院"
+            )
+            return ToolResult(
+                tool_name="spring_boot.search_movies",
+                data={
+                    "movies": movies,
+                    "cinemaId": cinema.get("id") or cinema_id,
+                    "cinemaName": cinema_name,
+                    "source": "spring_boot_database",
+                },
+                message=f"已在{cinema_name}找到 {len(movies)} 部有排片的影片。",
+            )
+
         data = self._get_business(
             "/api/user/movies",
             arguments,
@@ -745,7 +811,7 @@ class SpringBootMovieTicketMCP:
                         "seatId": seat.get("id"),
                         "row": row_no,
                         "number": seat.get("seatNo"),
-                        "status": str(seat.get("status") or "AVAILABLE").lower(),
+                        "status": self._normalize_seat_status(seat.get("status")),
                         "price": seat.get("price") or data.get("basePrice"),
                     }
                 )
@@ -757,6 +823,186 @@ class SpringBootMovieTicketMCP:
                 "raw": data,
             },
             message="已从票务数据库加载座位图。",
+        )
+
+    def _normalize_seat_status(self, value: Any) -> str:
+        numeric_statuses = {
+            0: "available",
+            1: "locked",
+            2: "sold",
+            3: "unavailable",
+            4: "couple",
+        }
+        if isinstance(value, int):
+            return numeric_statuses.get(value, "unavailable")
+        text = str(value or "AVAILABLE").strip().lower()
+        return {
+            "available": "available",
+            "locked": "locked",
+            "sold": "sold",
+            "unavailable": "unavailable",
+            "couple": "couple",
+        }.get(text, "unavailable")
+
+    def lock_seats(self, arguments: dict[str, Any]) -> ToolResult:
+        """Persist the AI purchase draft, then use Java's real lock-and-order API."""
+        showtime_id = self._required_long(arguments.get("showtimeId"), "场次 ID")
+        seat_ids = self._long_list(arguments.get("seatIds"), "座位 ID")
+        if not seat_ids:
+            raise ValueError("请选择至少一个座位。")
+
+        draft = self._sync_purchase_draft(arguments, showtime_id, seat_ids)
+        draft_version = self._required_draft_version(draft)
+        raw = self._post_business(
+            "/api/user/orders/lock",
+            arguments,
+            {
+                "showtimeId": showtime_id,
+                "seatIds": seat_ids,
+                "draftVersion": draft_version,
+            },
+        )
+        movie = raw.get("movie") or {}
+        cinema = raw.get("cinema") or {}
+        data = {
+            "orderId": raw.get("orderId"),
+            "orderNo": raw.get("orderNo"),
+            "showtimeId": showtime_id,
+            "seatIds": seat_ids,
+            "amount": raw.get("amount"),
+            "status": "PAYMENT_PENDING",
+            "expiresAt": raw.get("expiresAt"),
+            "remainingSeconds": raw.get("remainingSeconds"),
+            "movieId": movie.get("id") or arguments.get("movieId"),
+            "movieName": movie.get("name") or arguments.get("movieName"),
+            "cinemaId": cinema.get("id") or arguments.get("cinemaId"),
+            "cinemaName": cinema.get("name") or arguments.get("cinemaName"),
+            "hallName": raw.get("hallName") or arguments.get("hallName"),
+            "hallType": raw.get("hallType") or arguments.get("hallType"),
+            "language": raw.get("language") or arguments.get("language"),
+            "date": raw.get("date") or arguments.get("date"),
+            "time": raw.get("time") or arguments.get("time"),
+            "startAt": raw.get("startAt") or arguments.get("startAt"),
+            "endAt": raw.get("endAt") or arguments.get("endAt"),
+            "seats": raw.get("seats") or [],
+            "draftVersion": draft_version,
+            "orderCreated": True,
+            "source": "spring_boot_database",
+        }
+        return ToolResult(
+            tool_name="spring_boot.lock_seats",
+            data=data,
+            message=f"已锁定 {len(seat_ids)} 个座位，订单已创建。",
+        )
+
+    def create_order(self, arguments: dict[str, Any]) -> ToolResult:
+        """Compatibility wrapper: Java creates the order inside /orders/lock."""
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        result = self.get_order({**arguments, "orderId": order_id})
+        if not result.success:
+            return result
+        result.tool_name = "spring_boot.create_order"
+        result.message = "订单已创建，等待支付。"
+        return result
+
+    def pay_order(self, arguments: dict[str, Any]) -> ToolResult:
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        idempotency_key = str(
+            arguments.get("idempotencyKey")
+            or f"agent-{uuid.uuid4().hex}"
+        )
+        raw = self._post_business(
+            f"/api/user/orders/{order_id}/pay/qrcode",
+            arguments,
+            {"idempotencyKey": idempotency_key},
+        )
+        payment_status = str(raw.get("paymentStatus") or raw.get("status") or "").upper()
+        qr_code = str(raw.get("qrCode") or raw.get("payForm") or "").strip()
+
+        if payment_status != "SUCCESS" and not qr_code:
+            raise ValueError("支付宝沙箱二维码未返回。")
+
+        order_result = self.get_order({**arguments, "orderId": order_id})
+        data = dict(order_result.data)
+        tickets = data.get("tickets") or []
+        ticket_status = "issued" if str(data.get("status") or "").upper() == "TICKETED" or tickets else None
+
+        data.update({
+            "orderId": data.get("orderId") or raw.get("orderId") or order_id,
+            "paymentStatus": payment_status or "PENDING",
+            "status": data.get("status") or ("PAYMENT_PENDING" if payment_status != "SUCCESS" else "SUCCESS"),
+            "paidAmount": data.get("amount"),
+            "qrCode": qr_code or None,
+            "ticketStatus": ticket_status,
+            "ticketCodes": [
+                item.get("ticketCode")
+                for item in tickets
+                if isinstance(item, dict) and item.get("ticketCode")
+            ],
+            "source": "spring_boot_database",
+        })
+        return ToolResult(
+            tool_name="spring_boot.pay_order",
+            data=data,
+            message=(
+                "支付成功，电子票已出票。"
+                if data["ticketStatus"] == "issued"
+                else "支付成功。"
+                if payment_status == "SUCCESS"
+                else "支付二维码已生成，请扫码支付。"
+            ),
+        )
+
+    def issue_ticket(self, arguments: dict[str, Any]) -> ToolResult:
+        """Java's pay endpoint issues tickets in the same transaction."""
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        result = self.get_order({**arguments, "orderId": order_id})
+        if not result.success:
+            return result
+        data = dict(result.data)
+        data["ticketStatus"] = "issued" if str(data.get("status", "")).upper() == "TICKETED" else None
+        data["source"] = "spring_boot_database"
+        return ToolResult(
+            tool_name="spring_boot.issue_ticket",
+            data=data,
+            message="订单已经出票。" if data.get("ticketStatus") == "issued" else "订单尚未出票。",
+        )
+
+    def get_order(self, arguments: dict[str, Any]) -> ToolResult:
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        raw = self._get_business(
+            f"/api/user/orders/{order_id}",
+            arguments,
+            {},
+        )
+        data = self._format_order(raw, order_id)
+        return ToolResult(
+            tool_name="spring_boot.get_order",
+            data=data,
+            message="订单已加载。",
+        )
+
+    def list_orders(self, arguments: dict[str, Any]) -> ToolResult:
+        raw = self._get_business(
+            "/api/user/orders",
+            arguments,
+            {
+                "page": arguments.get("page", 1),
+                "size": arguments.get("size", 20),
+                "status": arguments.get("status"),
+            },
+        )
+        records = raw.get("records") or []
+        return ToolResult(
+            tool_name="spring_boot.list_orders",
+            data={
+                "records": [self._format_order(item) for item in records],
+                "total": raw.get("total", len(records)),
+                "page": raw.get("page", arguments.get("page", 1)),
+                "size": raw.get("size", arguments.get("size", 20)),
+                "source": "spring_boot_database",
+            },
+            message=f"已从票务数据库加载 {len(records)} 个订单。",
         )
 
     def search_nearby_cinemas(self, arguments: dict[str, Any]) -> ToolResult:
@@ -808,6 +1054,116 @@ class SpringBootMovieTicketMCP:
         jwt = str(arguments.get("jwt") or "").strip()
         return {"Authorization": f"Bearer {jwt}"} if jwt else {}
 
+    def _required_long(self, value: Any, label: str) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}无效。")
+        if parsed <= 0:
+            raise ValueError(f"{label}无效。")
+        return parsed
+
+    def _long_list(self, values: Any, label: str) -> list[int]:
+        if not isinstance(values, list):
+            raise ValueError(f"{label}列表无效。")
+        result = []
+        for value in values:
+            result.append(self._required_long(value, label))
+        return result
+
+    def _required_draft_version(self, draft: dict[str, Any]) -> int:
+        try:
+            version = int(draft.get("version", 0))
+        except (TypeError, ValueError):
+            version = 0
+        if version < 0:
+            raise ValueError("购票草稿版本号无效。")
+        return version
+
+    def _sync_purchase_draft(
+        self,
+        arguments: dict[str, Any],
+        showtime_id: int,
+        seat_ids: list[int],
+    ) -> dict[str, Any]:
+        current = self._get_business(
+            "/api/user/draft/current",
+            arguments,
+            {},
+        )
+        version = self._required_draft_version(current)
+        body: dict[str, Any] = {
+            "version": version,
+            "showtimeId": showtime_id,
+            "ticketCount": len(seat_ids),
+            "seats": seat_ids,
+            "sourceMode": "AI",
+        }
+        for key in ("movieId", "cinemaId"):
+            value = arguments.get(key)
+            if value in [None, ""]:
+                continue
+            try:
+                body[key] = self._required_long(value, key)
+            except ValueError:
+                # NLU may still carry a non-database identifier; Java only accepts Long.
+                continue
+        start_at = arguments.get("startAt")
+        end_at = arguments.get("endAt")
+        if start_at or end_at:
+            body["dateTime"] = {
+                "start": str(start_at or ""),
+                "end": str(end_at or ""),
+            }
+        return self._post_business(
+            "/api/user/draft",
+            arguments,
+            body,
+        )
+
+    def _format_order(
+        self,
+        raw: dict[str, Any],
+        fallback_order_id: Any = None,
+    ) -> dict[str, Any]:
+        order_id = raw.get("id") or raw.get("orderId") or fallback_order_id
+        movie = raw.get("movie") or {}
+        cinema = raw.get("cinema") or {}
+        items = raw.get("items") or []
+        seats = [
+            {
+                "rowNo": item.get("rowNo"),
+                "seatNo": item.get("seatNo"),
+                "zone": item.get("zone"),
+                "price": item.get("unitPrice"),
+                "ticketCode": item.get("ticketCode"),
+            }
+            for item in items
+            if isinstance(item, dict)
+        ]
+        return {
+            "orderId": order_id,
+            "orderNo": raw.get("orderNo"),
+            "showtimeId": raw.get("showtimeId"),
+            "movieId": movie.get("id"),
+            "movieName": movie.get("name") or raw.get("movieName"),
+            "cinemaId": cinema.get("id"),
+            "cinemaName": cinema.get("name") or raw.get("cinemaName"),
+            "hallName": raw.get("hallName"),
+            "startAt": raw.get("startAt"),
+            "endAt": raw.get("endAt"),
+            "amount": raw.get("amount"),
+            "status": raw.get("status"),
+            "statusDesc": raw.get("statusDesc"),
+            "expiresAt": raw.get("expiresAt"),
+            "seats": seats,
+            "tickets": raw.get("tickets") or [],
+            "ticketStatus": "issued"
+            if str(raw.get("status") or "").upper() == "TICKETED"
+            else None,
+            "source": "spring_boot_database",
+        }
+
     def _get_business(
         self,
         path: str,
@@ -827,6 +1183,25 @@ class SpringBootMovieTicketMCP:
             raise ValueError(message)
         return payload.get("data") or {}
 
+    def _post_business(
+        self,
+        path: str,
+        arguments: dict[str, Any],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = httpx.post(
+            f"{self.base_url}{path}",
+            json=body,
+            headers=self._headers(arguments),
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code") not in [0, 1, None]:
+            message = payload.get("msg") or payload.get("message") or "票务数据库请求失败。"
+            raise ValueError(message)
+        return payload.get("data") or {}
+
     def _format_movie(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
             "movieId": item.get("id") or item.get("movieId"),
@@ -836,6 +1211,63 @@ class SpringBootMovieTicketMCP:
             "durationMinutes": item.get("duration"),
             "status": item.get("statusDesc") or item.get("status"),
         }
+
+    def _format_showtime_movies(
+        self,
+        data: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        cinema = data.get("cinema") or {}
+        movies: list[dict[str, Any]] = []
+        for group in data.get("movies") or []:
+            showtimes = group.get("showtimes") or []
+            prices = [
+                item.get("basePrice")
+                for item in showtimes
+                if item.get("basePrice") not in [None, ""]
+            ]
+            remaining_seats = [
+                item.get("remainingSeats")
+                for item in showtimes
+                if item.get("remainingSeats") not in [None, ""]
+            ]
+            movies.append(
+                {
+                    "movieId": group.get("id") or group.get("movieId"),
+                    "movieName": group.get("name") or group.get("movieName"),
+                    "genre": group.get("genre"),
+                    "score": group.get("rating") or group.get("score"),
+                    "durationMinutes": group.get("duration")
+                    or group.get("durationMinutes"),
+                    "poster": group.get("poster") or group.get("posterUrl"),
+                    "status": group.get("statusDesc") or group.get("status"),
+                    "showtimeCount": len(showtimes),
+                    "minPrice": min(prices) if prices else None,
+                    "remainingSeats": sum(int(value) for value in remaining_seats),
+                    "cinemaId": cinema.get("id") or arguments.get("cinemaId"),
+                    "cinemaName": cinema.get("name") or arguments.get("cinemaName"),
+                }
+            )
+        return movies
+
+    def _filter_movies(
+        self,
+        movies: list[dict[str, Any]],
+        keyword: Any,
+        genre: Any,
+    ) -> list[dict[str, Any]]:
+        normalized_keyword = str(keyword or "").strip().casefold()
+        normalized_genre = str(genre or "").strip().casefold()
+        filtered = []
+        for movie in movies:
+            movie_name = str(movie.get("movieName") or "").casefold()
+            movie_genre = str(movie.get("genre") or "").casefold()
+            if normalized_keyword and normalized_keyword not in movie_name:
+                continue
+            if normalized_genre and movie_genre and normalized_genre not in movie_genre:
+                continue
+            filtered.append(movie)
+        return filtered
 
     def _pick_movie(
         self,
@@ -879,6 +1311,7 @@ class SpringBootMovieTicketMCP:
                         "cinemaName": cinema.get("name"),
                         "hallName": item.get("hallName"),
                         "hallType": item.get("hallType"),
+                        "language": item.get("language"),
                         "date": str(start_at or "")[:10],
                         "time": str(start_at or "")[11:16],
                         "startAt": start_at,
@@ -900,7 +1333,11 @@ class SpringBootMovieTicketMCP:
         requested_time = str(time_range or "")
         min_seats = int(ticket_count or 0)
         filtered = []
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
         for showtime in showtimes:
+            start_at = self._parse_showtime_datetime(showtime.get("startAt"))
+            if start_at is not None and start_at <= now:
+                continue
             remaining = showtime.get("remainingSeats")
             if min_seats and remaining is not None and int(remaining) < min_seats:
                 continue
@@ -943,6 +1380,18 @@ class SpringBootMovieTicketMCP:
                 if earlier:
                     filtered = earlier
         return filtered
+
+    def _parse_showtime_datetime(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        return parsed.astimezone(ZoneInfo("Asia/Shanghai"))
 
     def _time_matches(self, showtime_time: Any, requested_time: str) -> bool:
         if not requested_time:

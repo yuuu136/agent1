@@ -1,15 +1,18 @@
 from collections.abc import Iterator
+from copy import deepcopy
 from datetime import datetime
+import json
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.agent.cards import card_builder
 from app.agent.graph import agent_graph
-from app.agent.nlu import nlu_engine
+from app.agent.nlu import is_greeting_text, nlu_engine
 from app.agent.planner import task_planner
 from app.agent.reference import reference_resolver
 from app.agent.state import merge_slots, session_store
 from app.agent.tools import agent_toolbox
+from app.clients.agent_memory import agent_memory_client
 from app.prompts import prompt_manager
 from app.schemas.agent import AgentPlan, AgentResponse, AgentState, ChatRequest, NLUResult, ToolResult
 from app.utils.config_handler import agent_config
@@ -30,6 +33,17 @@ class AgentService:
                     "success": True,
                 }
             )
+            memory_id = self._persist_turn(
+                request=request,
+                user_text=user_text,
+                response=response,
+                state=state,
+                action="greeting",
+                intent="greeting",
+            )
+            if memory_id:
+                state.memory_id = memory_id
+                response.session["memoryId"] = memory_id
             session_store.save(state)
             self._save_graph_state(graph_config, request, user_text, state)
             return response
@@ -59,6 +73,17 @@ class AgentService:
                 "success": result.success,
             }
         )
+        memory_id = self._persist_turn(
+            request=request,
+            user_text=user_text,
+            response=response,
+            state=state,
+            action=plan.action,
+            intent=nlu.intent,
+        )
+        if memory_id:
+            state.memory_id = memory_id
+            response.session["memoryId"] = memory_id
         session_store.save(state)
         self._save_graph_state(graph_config, request, user_text, state)
         return response
@@ -82,6 +107,17 @@ class AgentService:
                     "success": True,
                 }
             )
+            memory_id = self._persist_turn(
+                request=request,
+                user_text=user_text,
+                response=response,
+                state=state,
+                action="greeting",
+                intent="greeting",
+            )
+            if memory_id:
+                state.memory_id = memory_id
+                response.session["memoryId"] = memory_id
             session_store.save(state)
             self._save_graph_state(graph_config, request, user_text, state)
             yield "greeting", {"response": response}
@@ -104,22 +140,37 @@ class AgentService:
         ):
             node_name, node_update = next(iter(update.items()))
             graph_state.update(node_update)
+            if node_name == "response":
+                response = graph_state["response"]
+                state = graph_state["state"]
+                nlu = graph_state["nlu"]
+                plan = graph_state["plan"]
+                result = graph_state["result"]
+                state.history.append(
+                    {
+                        "user": user_text,
+                        "intent": nlu.intent,
+                        "action": plan.action,
+                        "success": result.success,
+                    }
+                )
+                memory_id = self._persist_turn(
+                    request=request,
+                    user_text=user_text,
+                    response=response,
+                    state=state,
+                    action=plan.action,
+                    intent=nlu.intent,
+                )
+                if memory_id:
+                    state.memory_id = memory_id
+                    response.session["memoryId"] = memory_id
+                    graph_state["state"] = state
+                    graph_state["response"] = response
+                session_store.save(state)
+                self._save_graph_state(graph_config, request, user_text, state)
+                node_update = {"response": response}
             yield node_name, node_update
-
-        state = graph_state["state"]
-        nlu = graph_state["nlu"]
-        plan = graph_state["plan"]
-        result = graph_state["result"]
-        state.history.append(
-            {
-                "user": user_text,
-                "intent": nlu.intent,
-                "action": plan.action,
-                "success": result.success,
-            }
-        )
-        session_store.save(state)
-        self._save_graph_state(graph_config, request, user_text, state)
 
     def extract_nlu(self, request: ChatRequest) -> NLUResult:
         return nlu_engine.extract(request)
@@ -128,6 +179,15 @@ class AgentService:
         return {"configurable": {"thread_id": session_id}}
 
     def _load_state(self, request: ChatRequest) -> AgentState:
+        persistent_memory = self._load_persistent_memory(request)
+        if persistent_memory:
+            restored = self._state_from_persistent_memory(
+                request,
+                persistent_memory,
+            )
+            if restored:
+                return restored
+
         graph_config = self._graph_config(request.sessionId)
         snapshot = agent_graph.get_state(graph_config)
         checkpoint_state = snapshot.values.get("state") if snapshot.values else None
@@ -139,6 +199,105 @@ class AgentService:
                 )
             return checkpoint_state.model_copy(deep=True)
         return session_store.get(request.sessionId, request.userId)
+
+    def _load_persistent_memory(
+        self,
+        request: ChatRequest,
+    ) -> dict[str, Any] | None:
+        return agent_memory_client.current(
+            jwt=request.jwt,
+            session_id=request.sessionId,
+            memory_id=request.memoryId,
+        )
+
+    def _state_from_persistent_memory(
+        self,
+        request: ChatRequest,
+        memory: dict[str, Any],
+    ) -> AgentState | None:
+        raw_state = memory.get("stateJson") or memory.get("state_json")
+        state_data: dict[str, Any] | None = None
+        if isinstance(raw_state, str) and raw_state.strip():
+            try:
+                parsed = json.loads(raw_state)
+                if isinstance(parsed, dict):
+                    state_data = parsed
+            except json.JSONDecodeError:
+                state_data = None
+        elif isinstance(raw_state, dict):
+            state_data = raw_state
+
+        try:
+            state = AgentState.model_validate(state_data or {})
+        except Exception:
+            state = session_store.get(request.sessionId, request.userId)
+
+        state.session_id = request.sessionId
+        state.user_id = request.userId or state.user_id
+        state.memory_id = memory.get("memoryId") or request.memoryId
+        messages = memory.get("messages") or []
+        if not state.history and isinstance(messages, list):
+            state.history = [
+                {
+                    "user": item.get("content", ""),
+                    "intent": item.get("intent", ""),
+                    "action": item.get("action", ""),
+                    "success": True,
+                }
+                for item in messages
+                if isinstance(item, dict) and item.get("role") == "user"
+            ]
+        return state
+
+    def _persist_turn(
+        self,
+        *,
+        request: ChatRequest,
+        user_text: str,
+        response: AgentResponse,
+        state: AgentState,
+        action: str,
+        intent: str,
+    ) -> str | None:
+        if not request.jwt:
+            return None
+
+        request_payload = {
+            "sessionId": request.sessionId,
+            "memoryId": request.memoryId or state.memory_id,
+            "userId": request.userId,
+            "type": request.type,
+            "text": request.text,
+            "event": request.event,
+            "payload": request.payload,
+        }
+        saved = agent_memory_client.save_turn(
+            jwt=request.jwt,
+            session_id=request.sessionId,
+            memory_id=request.memoryId or state.memory_id,
+            user_message=user_text,
+            assistant_message=response.message,
+            event=request.event,
+            intent=intent,
+            action=action,
+            state=response.state,
+            state_json=json.dumps(
+                state.model_dump(mode="json"),
+                ensure_ascii=False,
+            ),
+            request_json=json.dumps(
+                request_payload,
+                ensure_ascii=False,
+            ),
+            response_json=json.dumps(
+                response.model_dump(mode="json"),
+                ensure_ascii=False,
+            ),
+        )
+        if not saved:
+            return None
+        memory_id = saved.get("memoryId") or saved.get("memory_id")
+        return str(memory_id) if memory_id else None
 
     def _save_graph_state(
         self,
@@ -182,6 +341,7 @@ class AgentService:
             suggestions=["附近有什么电影院", "帮我订两张明晚8点后的喜剧片", "查一下退票规则"],
             session={
                 "sessionId": state.session_id,
+                "memoryId": state.memory_id,
                 "intent": "greeting",
                 "slots": state.slots,
                 "pendingAction": None,
@@ -236,6 +396,7 @@ class AgentService:
             suggestions=suggestions,
             session={
                 "sessionId": state.session_id,
+                "memoryId": state.memory_id,
                 "intent": state.intent,
                 "slots": state.slots,
                 "pendingAction": state.pending_action,
@@ -262,6 +423,41 @@ class AgentService:
             result.message = "已取消当前购票流程。"
             return
 
+        if plan.action == "confirm_selection" and plan.params.get("skipSnacks"):
+            state.slots.pop("snackIds", None)
+            state.selected.pop("snack_candidates", None)
+            state.pending_action = None
+            result.data = {"skipped": "snacks"}
+            result.message = "好的，已跳过零食。"
+            return
+
+        if plan.action == "confirm_selection" and plan.params.get("skipCoupon"):
+            state.slots.pop("couponId", None)
+            state.selected.pop("coupon_candidates", None)
+            state.pending_action = None
+            result.data = {"skipped": "coupon"}
+            result.message = "好的，已跳过优惠券。"
+            return
+
+        if plan.action == "search_movies":
+            state.selected.pop("movie_candidates", None)
+        if plan.action == "search_showtimes":
+            state.selected.pop("showtime_candidates", None)
+            state.selected.pop("order", None)
+            state.selected.pop("ticket", None)
+            state.selected.pop("calendar", None)
+            state.selected.pop("notification", None)
+        if plan.action == "search_nearby_cinemas":
+            state.selected.pop("cinema_candidates", None)
+        if plan.action in {
+            "search_showtimes",
+            "search_nearby_cinemas",
+            "get_seats",
+        }:
+            state.selected.pop("seat_map", None)
+
+        if "movies" in data and data["movies"]:
+            state.selected["movie_candidates"] = data["movies"]
         if "showtimes" in data and data["showtimes"]:
             state.selected["showtime_candidates"] = data["showtimes"]
         if "seats" in data:
@@ -274,49 +470,320 @@ class AgentService:
         if "coupons" in data:
             state.selected["coupon_candidates"] = data["coupons"]
 
-        for key in ["showtimeId", "seatIds", "orderId", "lockId", "couponId", "snackIds"]:
+        if plan.action == "search_showtimes":
+            state.slots.pop("changeShowtime", None)
+
+        for key in [
+            "showtimeId",
+            "seatIds",
+            "orderId",
+            "lockId",
+            "couponId",
+            "snackIds",
+            "movieId",
+            "movieName",
+            "cinemaId",
+            "cinemaName",
+            "hallName",
+            "hallType",
+            "language",
+            "date",
+            "time",
+            "startAt",
+            "endAt",
+            "seatPositions",
+            "amount",
+            "status",
+            "expiresAt",
+        ]:
             if key in data:
                 state.slots[key] = data[key]
 
+        if plan.action == "search_showtimes" and result.success:
+            self._auto_lock_explicit_seats(state, plan, result)
+            if result.data.get("paymentReady"):
+                return
+
+        if (
+            plan.action == "get_seats"
+            and result.success
+            and state.slots.get("seatPositions")
+        ):
+            self._auto_lock_explicit_seats(state, plan, result)
+            if result.data.get("paymentReady"):
+                return
+
         if plan.action == "lock_seats" and result.success:
-            order_plan = AgentPlan(
-                action="create_order",
+            if data.get("orderCreated") and data.get("orderId"):
+                # Spring Boot creates the order as part of /orders/lock.
+                state.selected["order"] = data.copy()
+                state.slots["orderId"] = data.get("orderId")
+                result.data["order"] = data.copy()
+            else:
+                # Keep the local adapter's two-step contract for legacy /api/v1 use.
+                order_plan = AgentPlan(
+                    action="create_order",
+                    params={
+                        **state.slots,
+                        "lockId": data.get("lockId"),
+                        "showtimeId": data.get("showtimeId"),
+                        "seatIds": data.get("seatIds", []),
+                    },
+                    state="creating_order",
+                )
+                order_result = agent_toolbox.execute(order_plan, state)
+                if order_result.success:
+                    state.selected["order"] = order_result.data
+                    state.slots["orderId"] = order_result.data.get("orderId")
+                    result.data["order"] = order_result.data
+                    result.data["orderId"] = order_result.data.get("orderId")
+                    result.message = f"{result.message} {order_result.message}".strip()
+
+        pay_status = str(data.get("status", "")).upper()
+        if plan.action == "pay_order" and result.success and pay_status in {
+            "PAID",
+            "TICKETED",
+        }:
+            if pay_status == "TICKETED" or data.get("ticketStatus") == "issued":
+                ticket_data = data.copy()
+            else:
+                issue_plan = AgentPlan(
+                    action="issue_ticket",
+                    params={"orderId": data.get("orderId")},
+                    state="issuing_ticket",
+                )
+                issue_result = agent_toolbox.execute(issue_plan, state)
+                if not issue_result.success:
+                    return
+                ticket_data = issue_result.data
+
+            state.selected["ticket"] = ticket_data
+            result.data.update(ticket_data)
+            result.data["ticketStatus"] = ticket_data.get(
+                "ticketStatus",
+                "issued",
+            )
+            result.data.update(
+                self._after_issue_ticket(state, ticket_data)
+            )
+
+    def _auto_lock_explicit_seats(
+        self,
+        state: AgentState,
+        plan: AgentPlan,
+        result: ToolResult,
+    ) -> None:
+        positions = state.slots.get("seatPositions")
+        showtimes = result.data.get("showtimes") or []
+        jwt = plan.params.get("jwt")
+        if not isinstance(positions, list) or not positions or not jwt:
+            return
+
+        if plan.action == "get_seats":
+            showtime_id = result.data.get("showtimeId") or state.slots.get("showtimeId")
+            if not showtime_id:
+                return
+            showtime = {
+                key: state.slots[key]
+                for key in [
+                    "showtimeId",
+                    "movieId",
+                    "movieName",
+                    "cinemaId",
+                    "cinemaName",
+                    "hallName",
+                    "hallType",
+                    "language",
+                    "date",
+                    "time",
+                    "startAt",
+                    "endAt",
+                    "price",
+                ]
+                if key in state.slots and state.slots[key] not in [None, ""]
+            }
+            showtime.update(
+                {
+                    key: result.data[key]
+                    for key in [
+                        "showtimeId",
+                        "movieId",
+                        "movieName",
+                        "cinemaId",
+                        "cinemaName",
+                        "hallName",
+                        "hallType",
+                        "language",
+                        "date",
+                        "time",
+                        "startAt",
+                        "endAt",
+                        "price",
+                    ]
+                    if key in result.data and result.data[key] not in [None, ""]
+                }
+            )
+            showtime["showtimeId"] = showtime_id
+            seat_result = result
+        else:
+            if len(showtimes) != 1 or not isinstance(showtimes[0], dict):
+                return
+            showtime = showtimes[0]
+            showtime_id = showtime.get("showtimeId")
+            if not showtime_id:
+                return
+            seat_result = agent_toolbox.execute(
+                AgentPlan(
+                    action="get_seats",
+                    params={
+                        **state.slots,
+                        **showtime,
+                        "jwt": jwt,
+                        "showtimeId": showtime_id,
+                    },
+                    state="selecting_seats",
+                ),
+                state,
+            )
+
+        if not showtime_id:
+            return
+
+        self._remember_showtime_context(state, showtime)
+        seat_map_data = deepcopy(seat_result.data)
+        if not seat_result.success:
+            result.data.clear()
+            result.data.update(seat_map_data)
+            result.message = seat_result.message
+            state.state = "selecting_seats"
+            state.pending_action = "get_seats"
+            return
+
+        seats = seat_result.data.get("seats") or []
+        selected_ids: list[Any] = []
+        missing: list[str] = []
+        unavailable: list[str] = []
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            row_no = self._as_int(position.get("rowNo"))
+            seat_no = self._as_int(position.get("seatNo"))
+            label = f"{row_no}排{seat_no}座"
+            match = next(
+                (
+                    seat
+                    for seat in seats
+                    if isinstance(seat, dict)
+                    and self._as_int(seat.get("row")) == row_no
+                    and self._as_int(seat.get("number")) == seat_no
+                ),
+                None,
+            )
+            if not match or match.get("seatId") in [None, ""]:
+                missing.append(label)
+                continue
+            if str(match.get("status") or "").lower() in {
+                "locked",
+                "sold",
+                "unavailable",
+                "couple",
+            }:
+                unavailable.append(label)
+                continue
+            selected_ids.append(match["seatId"])
+
+        if missing:
+            result.data.clear()
+            result.data.update(seat_map_data)
+            result.message = f"座位图中没有找到：{'、'.join(missing)}。请重新选择座位。"
+            state.state = "selecting_seats"
+            state.pending_action = "get_seats"
+            return
+        if unavailable:
+            result.data.clear()
+            result.data.update(seat_map_data)
+            result.message = f"指定座位已被占用：{'、'.join(unavailable)}。请重新选择座位。"
+            state.state = "selecting_seats"
+            state.pending_action = "get_seats"
+            return
+
+        lock_result = agent_toolbox.execute(
+            AgentPlan(
+                action="lock_seats",
                 params={
                     **state.slots,
-                    "lockId": data.get("lockId"),
-                    "showtimeId": data.get("showtimeId"),
-                    "seatIds": data.get("seatIds", []),
+                    **showtime,
+                    "jwt": jwt,
+                    "showtimeId": showtime_id,
+                    "seatIds": selected_ids,
+                    "ticketCount": len(selected_ids),
                 },
-                state="creating_order",
-            )
-            order_result = agent_toolbox.execute(order_plan, state)
-            if order_result.success:
-                state.selected["order"] = order_result.data
-                state.slots["orderId"] = order_result.data.get("orderId")
-                result.data["order"] = order_result.data
-                result.data["orderId"] = order_result.data.get("orderId")
-                result.message = f"{result.message} {order_result.message}".strip()
+                state="locking_seats",
+            ),
+            state,
+        )
+        if not lock_result.success:
+            result.data.clear()
+            result.data.update(seat_map_data)
+            result.message = lock_result.message
+            state.state = "selecting_seats"
+            state.pending_action = "get_seats"
+            return
 
-        if plan.action == "pay_order" and str(data.get("status", "")).upper() in {
-            "PAID",
-            "paid",
-        }:
-            issue_plan = AgentPlan(
-                action="issue_ticket",
-                params={"orderId": data.get("orderId")},
-                state="issuing_ticket",
-            )
-            issue_result = agent_toolbox.execute(issue_plan, state)
-            if issue_result.success:
-                state.selected["ticket"] = issue_result.data
-                result.data.update(issue_result.data)
-                result.data["ticketStatus"] = issue_result.data.get(
-                    "ticketStatus",
-                    "issued",
+        state.selected["seat_map"] = seat_map_data
+        state.selected["order"] = lock_result.data.copy()
+        state.state = "paying"
+        state.pending_action = "pay_order"
+        state.slots["showtimeId"] = showtime_id
+        state.slots["seatIds"] = selected_ids
+        state.slots["orderId"] = lock_result.data.get("orderId")
+        result.data.clear()
+        result.data.update(lock_result.data)
+        result.data["paymentReady"] = True
+        result.data["seatPositions"] = positions
+        result.message = (
+            f"已按你的要求选择{'、'.join(self._seat_position_labels(positions))}，"
+            "座位已锁定，订单已创建，可以直接支付。"
+        )
+
+    def _remember_showtime_context(
+        self,
+        state: AgentState,
+        showtime: dict[str, Any],
+    ) -> None:
+        for key in [
+            "showtimeId",
+            "movieId",
+            "movieName",
+            "cinemaId",
+            "cinemaName",
+            "hallName",
+            "hallType",
+            "language",
+            "date",
+            "time",
+            "startAt",
+            "endAt",
+            "price",
+        ]:
+            value = showtime.get(key)
+            if value not in [None, ""]:
+                state.slots[key] = value
+
+    def _as_int(self, value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _seat_position_labels(self, positions: list[Any]) -> list[str]:
+        labels = []
+        for position in positions:
+            if isinstance(position, dict):
+                labels.append(
+                    f"{position.get('rowNo')}排{position.get('seatNo')}座"
                 )
-                result.data.update(
-                    self._after_issue_ticket(state, issue_result.data)
-                )
+        return labels
 
     def _after_issue_ticket(
         self,
@@ -355,10 +822,16 @@ class AgentService:
     def _should_greet(self, request: ChatRequest, state: AgentState, user_text: str) -> bool:
         if request.event:
             return False
-        if request.payload:
+        # draftId is request context added by the frontend; it should not
+        # turn a plain greeting into a booking step.
+        payload = request.payload or {}
+        if any(
+            key not in {"draftId", "draft_id"}
+            and value not in (None, "", [], {})
+            for key, value in payload.items()
+        ):
             return False
-        normalized = user_text.strip().lower()
-        return not normalized or normalized in {"hi", "hello", "你好", "您好", "开始", "start"}
+        return not user_text.strip() or is_greeting_text(user_text)
 
     def _ask_message(self, action: str) -> str:
         messages = {
@@ -378,11 +851,18 @@ class AgentService:
             return "零食已加入选择，可以继续选座或确认订单。"
         if plan.action == "confirm_selection" and "优惠券" in plan.reason:
             return "优惠券已加入选择，可以继续选座或确认订单。"
+        if plan.action == "pay_order":
+            if result.data.get("ticketStatus") == "issued" or str(result.data.get("status", "")).upper() == "TICKETED":
+                return "支付成功，电子票已出票。"
+            if result.data.get("qrCode"):
+                return "支付二维码已生成，请扫码支付。"
+            if str(result.data.get("paymentStatus", "")).upper() == "SUCCESS":
+                return "支付成功。"
         return {
             "confirm_selection": "请确认当前选择。",
             "lock_seats": "座位已锁定，可以创建订单。",
             "create_order": "订单已创建。",
-            "pay_order": "支付已完成。",
+            "pay_order": "支付二维码已生成，请扫码支付。",
             "cancel": "已取消当前购票流程。",
         }.get(plan.action, "已完成当前步骤。")
 

@@ -84,6 +84,7 @@ def _stream_response(request: StreamChatRequest) -> Iterator[str]:
             payload.update(request.payload)
         chat_request = ChatRequest(
             sessionId=request.sessionId,
+            memoryId=request.memoryId,
             userId=request.userId,
             jwt=request.jwt,
             text=request.message,
@@ -125,6 +126,7 @@ def _stream_response(request: StreamChatRequest) -> Iterator[str]:
                     {
                         "traceId": trace_id,
                         "state": response.state,
+                        "memoryId": response.session.get("memoryId"),
                     },
                 )
                 continue
@@ -137,6 +139,7 @@ def _stream_response(request: StreamChatRequest) -> Iterator[str]:
                     {
                         "traceId": trace_id,
                         "state": response.state,
+                        "memoryId": response.session.get("memoryId"),
                     },
                 )
                 continue

@@ -29,6 +29,7 @@ AgentAction = Literal[
 
 class ChatRequest(BaseModel):
     sessionId: str
+    memoryId: str | None = None
     userId: str | None = None
     jwt: str | None = None
     type: str = "text"
@@ -39,6 +40,7 @@ class ChatRequest(BaseModel):
 
 class StreamChatRequest(BaseModel):
     sessionId: str
+    memoryId: str | None = None
     draftId: int | None = None
     message: str
     event: str | None = None
@@ -65,6 +67,7 @@ class NLUResult(BaseModel):
 
 class AgentState(BaseModel):
     session_id: str
+    memory_id: str | None = None
     user_id: str | None = None
     state: str = "idle"
     intent: str = "smalltalk"

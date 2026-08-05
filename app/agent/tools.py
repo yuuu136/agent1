@@ -14,16 +14,23 @@ class AgentToolbox:
         if action == "answer_price":
             return self.answer_price(plan.params, state)
         if action == "search_nearby_cinemas":
+            # Nearby lookup must still validate browser coordinates when unauthenticated.
             return mcp_dispatcher.call("spring_boot", "search_nearby_cinemas", plan.params)
         if action in {"search_movies", "search_showtimes", "get_seats"}:
-            return mcp_dispatcher.call("spring_boot", action, plan.params)
+            server = "spring_boot" if plan.params.get("jwt") else "movie_ticket"
+            return mcp_dispatcher.call(server, action, plan.params)
         if action in {
             "lock_seats",
             "create_order",
             "pay_order",
             "issue_ticket",
+            "get_order",
+            "list_orders",
         }:
-            return mcp_dispatcher.call("movie_ticket", action, plan.params)
+            # Authenticated browser sessions use the real Java transaction API.
+            # Keep the unauthenticated local adapter only for demo/test sessions.
+            server = "spring_boot" if plan.params.get("jwt") else "movie_ticket"
+            return mcp_dispatcher.call(server, action, plan.params)
         if action == "recommend_snacks":
             return mcp_dispatcher.call("snack", action, plan.params)
         if action == "recommend_coupons":

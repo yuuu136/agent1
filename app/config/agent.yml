@@ -43,6 +43,8 @@ spring_boot:
     pay_order: /internal/orders/{order_id}/pay
     get_order: /internal/orders/{order_id}
     get_user_preferences: /internal/users/{user_id}/preferences
+    agent_memory_current: /api/user/agent/memory/current
+    agent_memory_turn: /api/user/agent/memory/turn
 
 mcp:
   amap:

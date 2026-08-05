@@ -1,6 +1,7 @@
 import re
 from typing import Any
 
+from app.agent.nlu import SHOWTIME_QUERY_TEXTS
 from app.schemas.agent import AgentState, NLUResult
 
 
@@ -16,6 +17,16 @@ CHINESE_ORDINALS = {
     "八": 8,
     "九": 9,
     "十": 10,
+}
+ANY_TIME_TEXTS = {
+    "都可以",
+    "都行",
+    "随便",
+    "不限",
+    "时间不限",
+    "什么时候都可以",
+    "哪个时间都可以",
+    "无所谓",
 }
 
 
@@ -41,6 +52,7 @@ class ReferenceResolver:
                     "cinemaName",
                     "showtimeId",
                     "seatIds",
+                    "seatPositions",
                     "orderId",
                     "lockId",
                     "couponId",
@@ -50,18 +62,51 @@ class ReferenceResolver:
             if "还是老位置" in text:
                 slots["seatPreference"] = state.slots.get("seatPreference", "middle")
 
+        if self._is_change_showtime(text):
+            slots["changeShowtime"] = True
+            self._clear_downstream_selection(slots)
+
+        if nlu.intent == "seat_query" and slots.get("seatPositions"):
+            # A seat replacement keeps the selected showtime, but invalidates
+            # any previous seat lock or order draft.
+            self._add_clear_slots(
+                slots,
+                "seatIds",
+                "orderId",
+                "lockId",
+                "couponId",
+                "snackIds",
+                "price",
+            )
+
         ordinal = self._extract_ordinal(text)
         if ordinal is not None:
-            self._apply_candidate_ordinal(state, slots, ordinal)
+            self._apply_candidate_ordinal(state, slots, ordinal, text)
 
         if any(word in text for word in ["这个", "这场", "这家"]) and state.selected:
-            self._apply_current_selection(state, slots)
+            self._apply_current_selection(state, slots, text)
 
         if state.pending_action == "ask_time":
             self._normalize_followup_time(text, slots)
 
+        if slots.get("timeRange"):
+            self._add_clear_slots(slots, "timePreference")
+            if state.slots.get("showtimeId"):
+                self._clear_downstream_selection(slots)
+        if slots.get("date") and state.slots.get("showtimeId"):
+            self._clear_downstream_selection(slots)
+        if slots.get("timePreference") and state.slots.get("showtimeId"):
+            self._clear_downstream_selection(slots)
+
         intent = nlu.intent
-        if self._should_continue_booking(state, nlu, slots):
+        if state.pending_action == "ask_time" and self._is_any_time(text):
+            slots["timePreference"] = "any"
+            self._add_clear_slots(slots, "timeRange")
+            slots.pop("timeRange", None)
+            intent = "book_ticket"
+        elif slots.get("changeShowtime"):
+            intent = "book_ticket"
+        elif self._should_continue_booking(state, nlu, slots):
             intent = "book_ticket"
 
         return nlu.model_copy(update={"intent": intent, "slots": slots})
@@ -70,12 +115,16 @@ class ReferenceResolver:
         slots["__clearSlots"] = [
             "showtimeId",
             "seatIds",
+            "seatPositions",
             "orderId",
             "lockId",
-            "couponId",
-            "snackIds",
-            "price",
-        ]
+                "couponId",
+                "snackIds",
+                "price",
+                "amount",
+                "status",
+                "expiresAt",
+            ]
 
     def _is_change_cinema(self, text: str) -> bool:
         return any(
@@ -91,6 +140,60 @@ class ReferenceResolver:
                 "换个电影院",
                 "换一家电影院",
             ]
+        )
+
+    def _is_change_showtime(self, text: str) -> bool:
+        if any(
+            phrase in text
+            for phrase in [
+                "换一场",
+                "换个场次",
+                "换时间",
+                "换个时间",
+                "重新选场次",
+                "重选场次",
+                "不要这场",
+                "不想要这场",
+                "下一场",
+                "再来一场",
+            ]
+        ):
+            return True
+        if (
+            any(word in text for word in ["换", "改", "更换", "重新", "重选"])
+            and any(hall in text.upper() for hall in ["IMAX", "杜比", "巨幕", "激光"])
+        ):
+            return True
+        if (
+            any(word in text for word in ["换", "改", "更换", "重新", "重选"])
+            and "场" in text
+        ):
+            return True
+        return bool(
+            re.search(
+                r"(?:选|挑|找)(?:择)?(?:个|一个|一场)?"
+                r"[^，。！？,.!?]{0,12}场次",
+                text,
+            )
+        )
+
+    def _add_clear_slots(self, slots: dict[str, Any], *keys: str) -> None:
+        current = slots.get("__clearSlots")
+        clear_slots = list(current) if isinstance(current, list) else []
+        for key in keys:
+            if key not in clear_slots:
+                clear_slots.append(key)
+        slots["__clearSlots"] = clear_slots
+
+    def _is_any_time(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text.strip(" ，。,.!?！？"))
+        if normalized in ANY_TIME_TEXTS | SHOWTIME_QUERY_TEXTS:
+            return True
+        return bool(
+            re.fullmatch(
+                r"(?:今天|明天|周末)(?:就)?(?:行|可以|好|都行|都可以|随便|无所谓|不限)",
+                normalized,
+            )
         )
 
     def _should_continue_booking(
@@ -135,8 +238,10 @@ class ReferenceResolver:
             slots["timeRange"] = f"{hour + 12:02d}:{match.group(2)}"
 
     def _extract_ordinal(self, text: str) -> int | None:
+        if "下一个" in text:
+            return None
         match = re.search(
-            r"第?\s*(\d+|[一二两三四五六七八九十])\s*(?:个|家|场|项)",
+            r"第?\s*(\d+|[一二两三四五六七八九十])\s*(?:个|家|场|项|部)",
             text,
         )
         if not match:
@@ -149,14 +254,22 @@ class ReferenceResolver:
         state: AgentState,
         slots: dict[str, Any],
         ordinal: int,
+        text: str,
     ) -> None:
         index = ordinal - 1
         candidates = (
+            ("movie_candidates", "movieId"),
             ("showtime_candidates", "showtimeId"),
             ("cinema_candidates", "cinemaId"),
             ("snack_candidates", "snackIds"),
             ("coupon_candidates", "couponId"),
         )
+        preferred_key = self._candidate_key_for_text(text) or self._candidate_key_for_state(state)
+        if preferred_key:
+            candidates = (
+                (preferred_key, dict(candidates)[preferred_key]),
+                *tuple(item for item in candidates if item[0] != preferred_key),
+            )
         for selected_key, slot_key in candidates:
             items = state.selected.get(selected_key) or []
             if not isinstance(items, list) or not 0 <= index < len(items):
@@ -168,6 +281,7 @@ class ReferenceResolver:
                 slots[slot_key] = [item.get("snackId")]
             else:
                 slots[slot_key] = item.get(slot_key)
+            self._clear_for_candidate_selection(slots, slot_key)
             for key in (
                 "movieName",
                 "cinemaName",
@@ -183,13 +297,25 @@ class ReferenceResolver:
                     slots[key] = item[key]
             return
 
-    def _apply_current_selection(self, state: AgentState, slots: dict[str, Any]) -> None:
+    def _apply_current_selection(
+        self,
+        state: AgentState,
+        slots: dict[str, Any],
+        text: str,
+    ) -> None:
         candidates = (
+            ("movie_candidates", "movieId"),
             ("showtime_candidates", "showtimeId"),
             ("cinema_candidates", "cinemaId"),
             ("snack_candidates", "snackIds"),
             ("coupon_candidates", "couponId"),
         )
+        preferred_key = self._candidate_key_for_text(text) or self._candidate_key_for_state(state)
+        if preferred_key:
+            candidates = (
+                (preferred_key, dict(candidates)[preferred_key]),
+                *tuple(item for item in candidates if item[0] != preferred_key),
+            )
         for selected_key, slot_key in candidates:
             items = state.selected.get(selected_key) or []
             if not items:
@@ -201,6 +327,7 @@ class ReferenceResolver:
                 slots[slot_key] = [item.get("snackId")]
             else:
                 slots[slot_key] = item.get(slot_key)
+            self._clear_for_candidate_selection(slots, slot_key)
             for key in (
                 "movieName",
                 "cinemaName",
@@ -213,6 +340,74 @@ class ReferenceResolver:
                 if item.get(key) is not None:
                     slots[key] = item[key]
             return
+
+    def _clear_for_candidate_selection(
+        self,
+        slots: dict[str, Any],
+        slot_key: str,
+    ) -> None:
+        if slot_key == "movieId":
+            self._add_clear_slots(
+                slots,
+                "genre",
+                "showtimeId",
+                "seatIds",
+                "seatPositions",
+                "orderId",
+                "lockId",
+                "couponId",
+                "snackIds",
+                "price",
+            )
+        elif slot_key == "cinemaId":
+            self._add_clear_slots(
+                slots,
+                "showtimeId",
+                "seatIds",
+                "seatPositions",
+                "orderId",
+                "lockId",
+                "couponId",
+                "snackIds",
+                "price",
+            )
+        elif slot_key == "showtimeId":
+            self._add_clear_slots(
+                slots,
+                "seatIds",
+                "seatPositions",
+                "orderId",
+                "lockId",
+                "couponId",
+                "snackIds",
+                "price",
+            )
+
+    def _candidate_key_for_text(self, text: str) -> str | None:
+        if any(word in text for word in ["影院", "这家", "电影院"]):
+            return "cinema_candidates"
+        if any(word in text for word in ["场次", "这场", "场"]):
+            return "showtime_candidates"
+        if any(word in text for word in ["电影", "影片", "这部", "部"]):
+            return "movie_candidates"
+        if any(word in text for word in ["零食", "爆米花", "饮料", "套餐"]):
+            return "snack_candidates"
+        if any(word in text for word in ["优惠", "优惠券", "券"]):
+            return "coupon_candidates"
+        return None
+
+    def _candidate_key_for_state(self, state: AgentState) -> str | None:
+        if state.state == "selecting_movie" or state.pending_action == "search_movies":
+            return "movie_candidates"
+        if state.state == "selecting_cinema" or state.pending_action == "search_nearby_cinemas":
+            return "cinema_candidates"
+        if state.state == "selecting_showtime" or state.pending_action == "search_showtimes":
+            return "showtime_candidates"
+        if state.state == "selecting_snacks":
+            return "snack_candidates"
+        if state.state == "selecting_coupon":
+            return "coupon_candidates"
+        return None
 
 
 reference_resolver = ReferenceResolver()
