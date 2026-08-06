@@ -13,12 +13,15 @@ class AgentToolbox:
             return self.answer_with_rag(plan.params.get("query") or state.last_user_text)
         if action == "answer_price":
             return self.answer_price(plan.params, state)
+        if action == "get_current_location":
+            return self.get_current_location(plan.params)
         if action == "search_nearby_cinemas":
             # Nearby lookup must still validate browser coordinates when unauthenticated.
             return mcp_dispatcher.call("spring_boot", "search_nearby_cinemas", plan.params)
         if action in {"search_movies", "search_showtimes", "get_seats"}:
-            server = "spring_boot" if plan.params.get("jwt") else "movie_ticket"
-            return mcp_dispatcher.call(server, action, plan.params)
+            if not plan.params.get("jwt"):
+                return self.auth_required(action)
+            return mcp_dispatcher.call("spring_boot", action, plan.params)
         if action in {
             "lock_seats",
             "create_order",
@@ -27,25 +30,141 @@ class AgentToolbox:
             "get_order",
             "list_orders",
         }:
-            # Authenticated browser sessions use the real Java transaction API.
-            # Keep the unauthenticated local adapter only for demo/test sessions.
-            server = "spring_boot" if plan.params.get("jwt") else "movie_ticket"
-            return mcp_dispatcher.call(server, action, plan.params)
+            if not plan.params.get("jwt"):
+                return self.auth_required(action)
+            return mcp_dispatcher.call("spring_boot", action, plan.params)
         if action == "recommend_snacks":
-            return mcp_dispatcher.call("snack", action, plan.params)
-        if action == "recommend_coupons":
-            return mcp_dispatcher.call("coupon", action, plan.params)
-        if action == "create_calendar_event":
-            return mcp_dispatcher.call("calendar", "create_event", plan.params)
-        if action == "send_ticket_message":
-            return mcp_dispatcher.call("notification", "send_ticket_message", plan.params)
-        if action == "send_sms":
-            return mcp_dispatcher.call("notification", "send_sms", plan.params)
+            if not plan.params.get("jwt"):
+                return self.auth_required(action)
+            if not plan.params.get("orderId"):
+                return ToolResult(
+                    tool_name="spring_boot.recommend_snacks",
+                    success=False,
+                    data={"error": "ORDER_REQUIRED"},
+                    message="请先选择座位并创建订单后再选择零食。",
+                )
+            return mcp_dispatcher.call("spring_boot", action, plan.params)
+        if action == "replace_order_snacks":
+            if not plan.params.get("jwt"):
+                return self.auth_required(action)
+            if not plan.params.get("orderId"):
+                return ToolResult(
+                    tool_name="spring_boot.replace_order_snacks",
+                    success=False,
+                    data={"error": "ORDER_REQUIRED"},
+                    message="请先选择座位并创建订单后再加入零食。",
+                )
+            return mcp_dispatcher.call("spring_boot", action, plan.params)
 
         return ToolResult(
             tool_name=action,
             data={"params": plan.params},
         )
+
+    def auth_required(self, action: str) -> ToolResult:
+        return ToolResult(
+            tool_name=f"spring_boot.{action}",
+            success=False,
+            data={"error": "AUTH_REQUIRED"},
+            message="请先登录后再使用真实票务服务。",
+        )
+
+    def get_current_location(self, arguments: dict[str, Any]) -> ToolResult:
+        normalized = self._normalize_location(arguments.get("location"))
+        if not normalized:
+            return ToolResult(
+                tool_name="location.current",
+                success=False,
+                data={"error": "LOCATION_REQUIRED"},
+                message="未获取到浏览器经纬度，请允许定位后再查询你的具体位置。",
+            )
+
+        longitude, latitude = self._split_location(normalized)
+        data: dict[str, Any] = {
+            "location": normalized,
+            "longitude": longitude,
+            "latitude": latitude,
+            "source": "browser",
+        }
+        reverse_result = mcp_dispatcher.call(
+            "amap",
+            "regeocode",
+            {"location": normalized, "extensions": "base"},
+        )
+        if reverse_result.success:
+            regeocode = reverse_result.data.get("regeocode") or {}
+            address = self._regeocode_address(regeocode)
+            if address:
+                data["address"] = address
+            component = regeocode.get("addressComponent")
+            if isinstance(component, dict):
+                data["addressComponent"] = component
+            if address:
+                message = (
+                    f"你当前的位置是：{address}。"
+                    f"经度 {longitude:.6f}，纬度 {latitude:.6f}。"
+                )
+            else:
+                message = (
+                    f"已获取你的当前位置：经度 {longitude:.6f}，"
+                    f"纬度 {latitude:.6f}。"
+                )
+        else:
+            message = (
+                f"已获取你的当前位置：经度 {longitude:.6f}，"
+                f"纬度 {latitude:.6f}。地址解析暂不可用。"
+            )
+
+        return ToolResult(
+            tool_name="location.current",
+            data=data,
+            message=message,
+        )
+
+    def _normalize_location(self, value: Any) -> str | None:
+        if isinstance(value, dict):
+            longitude = value.get("longitude") or value.get("lng")
+            latitude = value.get("latitude") or value.get("lat")
+            if longitude in [None, ""] or latitude in [None, ""]:
+                return None
+            value = f"{longitude},{latitude}"
+        if value in [None, ""]:
+            return None
+        text = str(value).strip()
+        try:
+            longitude, latitude = self._split_location(text)
+        except (TypeError, ValueError):
+            return None
+        return f"{longitude:.6f},{latitude:.6f}"
+
+    def _split_location(self, value: str) -> tuple[float, float]:
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) != 2:
+            raise ValueError("location must be longitude,latitude")
+        longitude = float(parts[0])
+        latitude = float(parts[1])
+        if not -180 <= longitude <= 180 or not -90 <= latitude <= 90:
+            raise ValueError("location is out of range")
+        return longitude, latitude
+
+    def _regeocode_address(self, regeocode: dict[str, Any]) -> str:
+        formatted = regeocode.get("formatted_address")
+        if formatted:
+            return str(formatted)
+
+        component = regeocode.get("addressComponent")
+        if not isinstance(component, dict):
+            return ""
+        parts = [
+            component.get("province"),
+            component.get("city"),
+            component.get("district"),
+            component.get("township"),
+            (component.get("streetNumber") or {}).get("street")
+            if isinstance(component.get("streetNumber"), dict)
+            else None,
+        ]
+        return "".join(str(part) for part in parts if part not in [None, ""])
 
     def answer_with_rag(self, query: str) -> ToolResult:
         try:
@@ -90,7 +209,7 @@ class AgentToolbox:
         )
         if price is None:
             return ToolResult(
-                tool_name="movie_ticket.answer_price",
+                tool_name="spring_boot.answer_price",
                 success=False,
                 data={
                     "showtimeId": arguments.get("showtimeId")
@@ -121,7 +240,7 @@ class AgentToolbox:
             "totalPrice": total_price,
         }
         return ToolResult(
-            tool_name="movie_ticket.answer_price",
+            tool_name="spring_boot.answer_price",
             data=data,
             message=(
                 f"{movie_name}当前票价为{self._format_amount(price)}元/张，"

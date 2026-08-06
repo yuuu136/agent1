@@ -1,602 +1,19 @@
-import os
-import json
+﻿import os
 import re
-import time
 import uuid
-from copy import deepcopy
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from threading import RLock
+from datetime import datetime, timedelta
 from typing import Any, Protocol
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from app.schemas.agent import ToolResult
 from app.utils.config_handler import agent_config
-from app.utils.tool_path import get_project_abs_path
 
 
 class MCPClient(Protocol):
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
         pass
-
-
-class HttpMCPClient:
-    def __init__(
-        self,
-        server_name: str,
-        base_url: str | None = None,
-        token_env: str | None = None,
-        timeout_seconds: int = 15,
-    ) -> None:
-        self.server_name = server_name
-        self.base_url = base_url
-        self.token_env = token_env
-        self.timeout_seconds = timeout_seconds
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        if not self.base_url:
-            return ToolResult(
-                tool_name=f"{self.server_name}.{tool_name}",
-                success=False,
-                message=f"{self.server_name} MCP base_url is not configured.",
-                data={"arguments": arguments, "configured": False},
-            )
-
-        headers = {}
-        if self.token_env:
-            token = os.getenv(self.token_env)
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-
-        try:
-            response = httpx.post(
-                f"{self.base_url.rstrip('/')}/tools/{tool_name}",
-                json={"arguments": arguments},
-                headers=headers,
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except httpx.HTTPError as exc:
-            return ToolResult(
-                tool_name=f"{self.server_name}.{tool_name}",
-                success=False,
-                data={"error": str(exc)},
-                message=f"{self.server_name} MCP request failed.",
-            )
-
-        return ToolResult(
-            tool_name=f"{self.server_name}.{tool_name}",
-            success=bool(payload.get("success", True)),
-            data=payload.get("data", payload),
-            message=payload.get("message", ""),
-        )
-
-
-class LocalMovieTicketMCP:
-    """Stateful local movie-ticket core used before the Java backend is deployed."""
-
-    GENRE_ALIASES = {
-        "comedy": "喜剧",
-        "drama": "剧情",
-        "action": "动作",
-        "sci-fi": "科幻",
-        "science fiction": "科幻",
-        "animation": "动画",
-        "horror": "恐怖",
-        "romance": "爱情",
-    }
-
-    def __init__(self) -> None:
-        self._lock = RLock()
-        self.movies = [
-            {
-                "movieId": "m_1001",
-                "movieName": "流浪地球3",
-                "genre": "科幻",
-                "score": 9.1,
-                "durationMinutes": 150,
-                "status": "NOW_SHOWING",
-            },
-            {
-                "movieId": "m_1002",
-                "movieName": "喜剧之王",
-                "genre": "喜剧",
-                "score": 8.8,
-                "durationMinutes": 120,
-                "status": "NOW_SHOWING",
-            },
-            {
-                "movieId": "m_1003",
-                "movieName": "星际探险",
-                "genre": "科幻",
-                "score": 8.6,
-                "durationMinutes": 135,
-                "status": "NOW_SHOWING",
-            },
-        ]
-        self.showtimes = [
-            {
-                "showtimeId": "st_2001",
-                "movieId": "m_1001",
-                "movieName": "流浪地球3",
-                "cinemaId": "c_1001",
-                "cinemaName": "Cinema One",
-                "hallName": "1号IMAX厅",
-                "hallType": "IMAX",
-                "date": "today",
-                "time": "19:30",
-                "price": 42,
-            },
-            {
-                "showtimeId": "st_2002",
-                "movieId": "m_1001",
-                "movieName": "流浪地球3",
-                "cinemaId": "c_1002",
-                "cinemaName": "Cinema Two",
-                "hallName": "2号激光厅",
-                "hallType": "普通",
-                "date": "today",
-                "time": "21:10",
-                "price": 39,
-            },
-            {
-                "showtimeId": "st_2003",
-                "movieId": "m_1002",
-                "movieName": "喜剧之王",
-                "cinemaId": "c_1001",
-                "cinemaName": "Cinema One",
-                "hallName": "3号厅",
-                "hallType": "普通",
-                "date": "today",
-                "time": "20:00",
-                "price": 35,
-            },
-            {
-                "showtimeId": "st_2004",
-                "movieId": "m_1003",
-                "movieName": "星际探险",
-                "cinemaId": "c_1002",
-                "cinemaName": "Cinema Two",
-                "hallName": "1号IMAX厅",
-                "hallType": "IMAX",
-                "date": "today",
-                "time": "18:40",
-                "price": 45,
-            },
-        ]
-        self.seats: dict[str, list[dict[str, Any]]] = {
-            showtime["showtimeId"]: self._build_seats()
-            for showtime in self.showtimes
-        }
-        self.locks: dict[str, dict[str, Any]] = {}
-        self.orders: dict[str, dict[str, Any]] = {}
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        handlers = {
-            "search_movies": self.search_movies,
-            "search_showtimes": self.search_showtimes,
-            "get_seats": self.get_seats,
-            "lock_seats": self.lock_seats,
-            "create_order": self.create_order,
-            "pay_order": self.pay_order,
-            "issue_ticket": self.issue_ticket,
-            "get_order": self.get_order,
-            "list_orders": self.list_orders,
-        }
-        handler = handlers.get(tool_name)
-        if not handler:
-            return ToolResult(
-                tool_name=f"movie_ticket.{tool_name}",
-                success=False,
-                message=f"Unknown movie_ticket MCP tool: {tool_name}",
-            )
-        with self._lock:
-            self._release_expired_locks()
-            try:
-                return handler(arguments)
-            except (KeyError, TypeError, ValueError) as exc:
-                return ToolResult(
-                    tool_name=f"movie_ticket.{tool_name}",
-                    success=False,
-                    data={"error": str(exc)},
-                    message=str(exc),
-                )
-
-    def search_movies(self, arguments: dict[str, Any]) -> ToolResult:
-        keyword = str(
-            arguments.get("movieName")
-            or arguments.get("keyword")
-            or ""
-        ).strip().casefold()
-        genre = self._normalize_genre(arguments.get("genre"))
-        cinema_id = arguments.get("cinemaId")
-        movies = [
-            deepcopy(movie)
-            for movie in self.movies
-            if (
-                not keyword
-                or keyword in movie["movieName"].casefold()
-            )
-            and (
-                not genre
-                or genre in movie["genre"].casefold()
-            )
-        ]
-        if cinema_id:
-            cinema_movie_ids = {
-                showtime["movieId"]
-                for showtime in self.showtimes
-                if showtime.get("cinemaId") == cinema_id
-            }
-            movies = [
-                movie
-                for movie in movies
-                if movie.get("movieId") in cinema_movie_ids
-            ]
-        return ToolResult(
-            tool_name="movie_ticket.search_movies",
-            data={"movies": movies, "cinemaId": cinema_id},
-            message=f"已找到 {len(movies)} 部符合条件的电影。",
-        )
-
-    def search_showtimes(self, arguments: dict[str, Any]) -> ToolResult:
-        movie_name = str(arguments.get("movieName") or "").strip().casefold()
-        movie_id = arguments.get("movieId")
-        cinema_id = arguments.get("cinemaId")
-        genre = self._normalize_genre(arguments.get("genre"))
-        requested_date = arguments.get("date")
-        requested_time = arguments.get("timeRange")
-        price_preference = arguments.get("pricePreference")
-
-        showtimes = []
-        for showtime in self.showtimes:
-            movie = self._movie_by_id(showtime["movieId"])
-            if movie_id and showtime["movieId"] != movie_id:
-                continue
-            if movie_name and movie_name not in showtime["movieName"].casefold():
-                continue
-            if genre and genre not in movie["genre"].casefold():
-                continue
-            if cinema_id and showtime["cinemaId"] != cinema_id:
-                continue
-            if requested_date:
-                showtime = {**showtime, "date": requested_date}
-            if requested_time and not self._time_matches(showtime["time"], requested_time):
-                continue
-            if price_preference == "lower" and showtime["price"] > 40:
-                continue
-            item = deepcopy(showtime)
-            item["remainingSeats"] = self._available_count(item["showtimeId"])
-            showtimes.append(item)
-
-        showtimes.sort(
-            key=lambda item: (
-                item["price"] if price_preference == "lower" else 0,
-                item["time"],
-            )
-        )
-        return ToolResult(
-            tool_name="movie_ticket.search_showtimes",
-            data={"showtimes": showtimes},
-            message=f"已找到 {len(showtimes)} 个符合条件的场次。",
-        )
-
-    def get_seats(self, arguments: dict[str, Any]) -> ToolResult:
-        showtime_id = arguments.get("showtimeId")
-        self._showtime_by_id(showtime_id)
-        return ToolResult(
-            tool_name="movie_ticket.get_seats",
-            data={
-                "showtimeId": showtime_id,
-                "seats": deepcopy(self.seats[showtime_id]),
-            },
-            message="座位图已加载。",
-        )
-
-    def lock_seats(self, arguments: dict[str, Any]) -> ToolResult:
-        showtime_id = arguments.get("showtimeId")
-        seat_ids = arguments.get("seatIds") or []
-        user_id = arguments.get("userId") or "anonymous"
-        self._showtime_by_id(showtime_id)
-        if not seat_ids:
-            raise ValueError("请选择至少一个座位。")
-        seat_map = {seat["seatId"]: seat for seat in self.seats[showtime_id]}
-        missing = [seat_id for seat_id in seat_ids if seat_id not in seat_map]
-        if missing:
-            raise ValueError(f"座位不存在：{', '.join(missing)}")
-        unavailable = [
-            seat_id
-            for seat_id in seat_ids
-            if seat_map[seat_id]["status"] != "available"
-        ]
-        if unavailable:
-            return ToolResult(
-                tool_name="movie_ticket.lock_seats",
-                success=False,
-                data={
-                    "conflictSeatIds": unavailable,
-                    "showtimeId": showtime_id,
-                    "seats": deepcopy(self.seats[showtime_id]),
-                },
-                message=f"座位已被占用：{', '.join(unavailable)}",
-            )
-
-        lock_id = f"lock_{uuid.uuid4().hex[:10]}"
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
-        for seat_id in seat_ids:
-            seat_map[seat_id].update(
-                {
-                    "status": "locked",
-                    "lockId": lock_id,
-                    "lockOwner": user_id,
-                    "lockExpiresAt": expires_at.isoformat(),
-                }
-            )
-        self.locks[lock_id] = {
-            "lockId": lock_id,
-            "showtimeId": showtime_id,
-            "seatIds": list(seat_ids),
-            "userId": user_id,
-            "expiresAt": expires_at.isoformat(),
-            "status": "locked",
-        }
-        showtime = self._showtime_by_id(showtime_id)
-        total_amount = showtime["price"] * len(seat_ids)
-        return ToolResult(
-            tool_name="movie_ticket.lock_seats",
-            data={
-                "lockId": lock_id,
-                "showtimeId": showtime_id,
-                "seatIds": list(seat_ids),
-                "amount": total_amount,
-                "expiresAt": expires_at.isoformat(),
-            },
-            message=f"已锁定 {len(seat_ids)} 个座位，有效期 15 分钟。",
-        )
-
-    def create_order(self, arguments: dict[str, Any]) -> ToolResult:
-        lock_id = arguments.get("lockId")
-        lock = self._active_lock(lock_id)
-        order_id = f"ord_{uuid.uuid4().hex[:12]}"
-        showtime = self._showtime_by_id(lock["showtimeId"])
-        amount = showtime["price"] * len(lock["seatIds"])
-        order = {
-            "orderId": order_id,
-            "lockId": lock_id,
-            "showtimeId": lock["showtimeId"],
-            "seatIds": list(lock["seatIds"]),
-            "movieName": showtime["movieName"],
-            "cinemaName": showtime["cinemaName"],
-            "hallName": showtime["hallName"],
-            "date": showtime["date"],
-            "time": showtime["time"],
-            "amount": amount,
-            "status": "PAYMENT_PENDING",
-            "expiresAt": lock["expiresAt"],
-            "createdAt": datetime.now(timezone.utc).isoformat(),
-        }
-        self.orders[order_id] = order
-        return ToolResult(
-            tool_name="movie_ticket.create_order",
-            data=deepcopy(order),
-            message=f"订单已创建，应付 {amount} 元。",
-        )
-
-    def pay_order(self, arguments: dict[str, Any]) -> ToolResult:
-        order_id = arguments.get("orderId")
-        order = self.orders.get(order_id)
-        if not order:
-            raise ValueError("订单不存在。")
-        if order["status"] == "TICKETED":
-            return ToolResult(
-                tool_name="movie_ticket.pay_order",
-                data=deepcopy(order),
-                message="订单已经出票，无需重复支付。",
-            )
-        if order["status"] != "PAYMENT_PENDING":
-            raise ValueError(f"订单当前状态不可支付：{order['status']}")
-        self._active_lock(order["lockId"])
-        order["status"] = "PAID"
-        order["paidAt"] = datetime.now(timezone.utc).isoformat()
-        self._mark_order_seats(order, "sold")
-        return ToolResult(
-            tool_name="movie_ticket.pay_order",
-            data=deepcopy(order),
-            message="支付成功。",
-        )
-
-    def issue_ticket(self, arguments: dict[str, Any]) -> ToolResult:
-        order_id = arguments.get("orderId")
-        order = self.orders.get(order_id)
-        if not order:
-            raise ValueError("订单不存在。")
-        if order["status"] == "TICKETED":
-            return ToolResult(
-                tool_name="movie_ticket.issue_ticket",
-                data=deepcopy(order),
-                message="订单已经出票。",
-            )
-        if order["status"] != "PAID":
-            raise ValueError("订单尚未支付，不能出票。")
-        order["status"] = "TICKETED"
-        order["ticketStatus"] = "issued"
-        order["ticketCodes"] = [
-            f"TKT-{uuid.uuid4().hex[:10].upper()}"
-            for _ in order["seatIds"]
-        ]
-        order["issuedAt"] = datetime.now(timezone.utc).isoformat()
-        return ToolResult(
-            tool_name="movie_ticket.issue_ticket",
-            data=deepcopy(order),
-            message="出票成功。",
-        )
-
-    def get_order(self, arguments: dict[str, Any]) -> ToolResult:
-        order_id = arguments.get("orderId")
-        order = self.orders.get(order_id)
-        if not order:
-            raise ValueError("订单不存在。")
-        return ToolResult(
-            tool_name="movie_ticket.get_order",
-            data=deepcopy(order),
-            message="订单已加载。",
-        )
-
-    def list_orders(self, arguments: dict[str, Any]) -> ToolResult:
-        status = str(arguments.get("status") or "").strip().upper()
-        orders = []
-        for order in self.orders.values():
-            if status and str(order.get("status", "")).upper() != status:
-                continue
-            orders.append(deepcopy(order))
-        orders.sort(key=lambda item: item.get("createdAt", ""), reverse=True)
-        return ToolResult(
-            tool_name="movie_ticket.list_orders",
-            data={"orders": orders},
-            message=f"已加载 {len(orders)} 个订单。",
-        )
-
-    def _build_seats(self) -> list[dict[str, Any]]:
-        seats = []
-        for row in ["A", "B", "C", "D", "E", "F"]:
-            for number in range(1, 9):
-                seats.append(
-                    {
-                        "seatId": f"{row}{number}",
-                        "row": row,
-                        "number": number,
-                        "status": "available",
-                        "zone": "middle" if row in {"C", "D"} else "standard",
-                    }
-                )
-        return seats
-
-    def _movie_by_id(self, movie_id: str) -> dict[str, Any]:
-        for movie in self.movies:
-            if movie["movieId"] == movie_id:
-                return movie
-        raise ValueError(f"电影不存在：{movie_id}")
-
-    def _normalize_genre(self, genre: Any) -> str:
-        normalized = str(genre or "").strip().casefold()
-        return self.GENRE_ALIASES.get(normalized, normalized)
-
-    def _showtime_by_id(self, showtime_id: str) -> dict[str, Any]:
-        for showtime in self.showtimes:
-            if showtime["showtimeId"] == showtime_id:
-                return showtime
-        raise ValueError(f"场次不存在：{showtime_id}")
-
-    def _available_count(self, showtime_id: str) -> int:
-        return sum(
-            seat["status"] == "available"
-            for seat in self.seats[showtime_id]
-        )
-
-    def _time_matches(self, showtime_time: str, requested_time: str) -> bool:
-        if not requested_time:
-            return True
-        if requested_time in {"evening", "晚上"}:
-            return showtime_time >= "18:00"
-        if requested_time in {"afternoon", "下午"}:
-            return "12:00" <= showtime_time < "18:00"
-        if requested_time in {"morning", "上午"}:
-            return showtime_time < "12:00"
-        return showtime_time >= str(requested_time)
-
-    def _active_lock(self, lock_id: str | None) -> dict[str, Any]:
-        if not lock_id or lock_id not in self.locks:
-            raise ValueError("座位锁定不存在或已失效。")
-        lock = self.locks[lock_id]
-        if lock["status"] != "locked":
-            raise ValueError("座位锁定不可用。")
-        if datetime.fromisoformat(lock["expiresAt"]) <= datetime.now(timezone.utc):
-            self._release_lock(lock)
-            raise ValueError("座位锁定已过期，请重新选座。")
-        return lock
-
-    def _release_expired_locks(self) -> None:
-        now = datetime.now(timezone.utc)
-        for lock in list(self.locks.values()):
-            if (
-                lock["status"] == "locked"
-                and datetime.fromisoformat(lock["expiresAt"]) <= now
-            ):
-                self._release_lock(lock)
-
-    def _release_lock(self, lock: dict[str, Any]) -> None:
-        for seat in self.seats[lock["showtimeId"]]:
-            if seat.get("lockId") == lock["lockId"]:
-                seat.update(
-                    {
-                        "status": "available",
-                        "lockId": None,
-                        "lockOwner": None,
-                        "lockExpiresAt": None,
-                    }
-                )
-        lock["status"] = "expired"
-
-    def _mark_order_seats(self, order: dict[str, Any], status: str) -> None:
-        for seat in self.seats[order["showtimeId"]]:
-            if seat["seatId"] in order["seatIds"]:
-                seat.update(
-                    {
-                        "status": status,
-                        "lockId": None,
-                        "lockOwner": None,
-                        "lockExpiresAt": None,
-                    }
-                )
-        lock = self.locks.get(order["lockId"])
-        if lock:
-            lock["status"] = "consumed"
-
-class LocalSnackMCP:
-    """Temporary snack adapter behind the unified MCP dispatcher."""
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        if tool_name != "recommend_snacks":
-            return ToolResult(
-                tool_name=f"snack.{tool_name}",
-                success=False,
-                message=f"Unknown snack MCP tool: {tool_name}",
-            )
-        return ToolResult(
-            tool_name="snack.recommend_snacks",
-            data={
-                "snacks": [
-                    {"snackId": "sn_1", "name": "Popcorn combo", "price": 35},
-                    {"snackId": "sn_2", "name": "Two drinks", "price": 18},
-                ]
-            },
-            message="Snacks loaded from temporary local adapter.",
-        )
-
-
-class LocalCouponMCP:
-    """Temporary coupon adapter behind the unified MCP dispatcher."""
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        if tool_name != "recommend_coupons":
-            return ToolResult(
-                tool_name=f"coupon.{tool_name}",
-                success=False,
-                message=f"Unknown coupon MCP tool: {tool_name}",
-            )
-        return ToolResult(
-            tool_name="coupon.recommend_coupons",
-            data={
-                "coupons": [
-                    {"couponId": "cp_1", "name": "10 off 80", "discount": 10},
-                    {"couponId": "cp_2", "name": "Member 10% off", "discount": "10%"},
-                ]
-            },
-            message="Coupons loaded from temporary local adapter.",
-        )
 
 
 class SpringBootMovieTicketMCP:
@@ -617,6 +34,8 @@ class SpringBootMovieTicketMCP:
             "search_showtimes": self.search_showtimes,
             "get_seats": self.get_seats,
             "lock_seats": self.lock_seats,
+            "recommend_snacks": self.recommend_snacks,
+            "replace_order_snacks": self.replace_order_snacks,
             "create_order": self.create_order,
             "pay_order": self.pay_order,
             "issue_ticket": self.issue_ticket,
@@ -895,6 +314,61 @@ class SpringBootMovieTicketMCP:
             message=f"已锁定 {len(seat_ids)} 个座位，订单已创建。",
         )
 
+    def recommend_snacks(self, arguments: dict[str, Any]) -> ToolResult:
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        raw = self._get_business(
+            f"/api/user/orders/{order_id}/snacks",
+            arguments,
+            {},
+        )
+        options = raw.get("options") or []
+        snacks = [
+            self._format_snack_option(item)
+            for item in options
+            if isinstance(item, dict)
+        ]
+        cinema_name = raw.get("cinemaName") or arguments.get("cinemaName") or "当前影院"
+        return ToolResult(
+            tool_name="spring_boot.recommend_snacks",
+            data={
+                "orderId": raw.get("orderId") or order_id,
+                "cinemaId": raw.get("cinemaId") or arguments.get("cinemaId"),
+                "cinemaName": cinema_name,
+                "ticketAmount": raw.get("ticketAmount"),
+                "snackAmount": raw.get("snackAmount"),
+                "totalAmount": raw.get("totalAmount"),
+                "snacks": snacks,
+                "source": "spring_boot_database",
+            },
+            message=f"已从{cinema_name}加载 {len(snacks)} 个可选零食套餐。",
+        )
+
+    def replace_order_snacks(self, arguments: dict[str, Any]) -> ToolResult:
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        snack_ids = self._long_list(arguments.get("snackIds") or [], "零食 ID")
+        items = [
+            {
+                "snackId": snack_id,
+                "quantity": 1,
+            }
+            for snack_id in snack_ids
+        ]
+        raw = self._put_business(
+            f"/api/user/orders/{order_id}/snacks",
+            arguments,
+            {"items": items},
+        )
+        data = self._format_snack_selection(raw, fallback_order_id=order_id)
+        return ToolResult(
+            tool_name="spring_boot.replace_order_snacks",
+            data=data,
+            message=(
+                "零食已加入订单，"
+                f"零食金额 {self._format_yuan(data.get('snackAmount'))}，"
+                f"合计 {self._format_yuan(data.get('totalAmount'))}。"
+            ),
+        )
+
     def create_order(self, arguments: dict[str, Any]) -> ToolResult:
         """Compatibility wrapper: Java creates the order inside /orders/lock."""
         order_id = self._required_long(arguments.get("orderId"), "订单 ID")
@@ -1164,6 +638,75 @@ class SpringBootMovieTicketMCP:
             "source": "spring_boot_database",
         }
 
+    def _format_snack_option(self, raw: dict[str, Any]) -> dict[str, Any]:
+        price_fen = raw.get("priceFen")
+        try:
+            price = int(price_fen) / 100 if price_fen not in [None, ""] else None
+        except (TypeError, ValueError):
+            price = None
+        return {
+            "snackId": raw.get("id") or raw.get("snackId"),
+            "name": raw.get("name"),
+            "description": raw.get("description"),
+            "image": raw.get("image"),
+            "price": price,
+            "priceFen": price_fen,
+            "availableStock": raw.get("availableStock"),
+            "selectedQuantity": raw.get("selectedQuantity"),
+            "status": raw.get("status"),
+        }
+
+    def _format_snack_selection(
+        self,
+        raw: dict[str, Any],
+        fallback_order_id: int | None = None,
+    ) -> dict[str, Any]:
+        selected = raw.get("selected") or raw.get("items") or []
+        options = raw.get("options") or []
+        data = {
+            "orderId": raw.get("orderId") or fallback_order_id,
+            "cinemaId": raw.get("cinemaId"),
+            "cinemaName": raw.get("cinemaName"),
+            "ticketAmount": raw.get("ticketAmount"),
+            "snackAmount": raw.get("snackAmount"),
+            "totalAmount": raw.get("totalAmount"),
+            "selectedSnacks": [
+                self._format_order_snack_item(item)
+                for item in selected
+                if isinstance(item, dict)
+            ],
+            "snacks": [
+                self._format_snack_option(item)
+                for item in options
+                if isinstance(item, dict)
+            ],
+            "source": "spring_boot_database",
+        }
+        if data["totalAmount"] not in [None, ""]:
+            data["amount"] = data["totalAmount"]
+        return data
+
+    def _format_order_snack_item(self, raw: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "snackId": raw.get("snackId"),
+            "name": raw.get("name") or raw.get("snackName"),
+            "image": raw.get("image"),
+            "unitPrice": raw.get("unitPrice"),
+            "quantity": raw.get("quantity"),
+            "amount": raw.get("amount"),
+            "inventoryStatus": raw.get("inventoryStatus"),
+        }
+
+    def _format_yuan(self, value: Any) -> str:
+        if value in [None, ""]:
+            return "0元"
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return f"{value}元"
+        formatted = str(int(amount)) if amount.is_integer() else f"{amount:.2f}".rstrip("0").rstrip(".")
+        return f"{formatted}元"
+
     def _get_business(
         self,
         path: str,
@@ -1202,13 +745,42 @@ class SpringBootMovieTicketMCP:
             raise ValueError(message)
         return payload.get("data") or {}
 
+    def _put_business(
+        self,
+        path: str,
+        arguments: dict[str, Any],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = httpx.put(
+            f"{self.base_url}{path}",
+            json=body,
+            headers=self._headers(arguments),
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code") not in [0, 1, None]:
+            message = payload.get("msg") or payload.get("message") or "票务数据库请求失败。"
+            raise ValueError(message)
+        return payload.get("data") or {}
+
     def _format_movie(self, item: dict[str, Any]) -> dict[str, Any]:
+        poster = (
+            item.get("posterUrl")
+            or item.get("poster")
+            or item.get("moviePoster")
+            or item.get("cover")
+            or item.get("coverUrl")
+            or item.get("image")
+        )
         return {
             "movieId": item.get("id") or item.get("movieId"),
             "movieName": item.get("name") or item.get("movieName"),
             "genre": item.get("genre"),
             "score": item.get("rating") or item.get("score"),
             "durationMinutes": item.get("duration"),
+            "poster": poster,
+            "posterUrl": poster,
             "status": item.get("statusDesc") or item.get("status"),
         }
 
@@ -1240,6 +812,7 @@ class SpringBootMovieTicketMCP:
                     "durationMinutes": group.get("duration")
                     or group.get("durationMinutes"),
                     "poster": group.get("poster") or group.get("posterUrl"),
+                    "posterUrl": group.get("posterUrl") or group.get("poster"),
                     "status": group.get("statusDesc") or group.get("status"),
                     "showtimeCount": len(showtimes),
                     "minPrice": min(prices) if prices else None,
@@ -1679,454 +1252,12 @@ class AMapMCP:
         return value
 
 
-class CalendarMCP:
-    def __init__(self, http_client: HttpMCPClient) -> None:
-        self.http_client = http_client
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        return self.http_client.call_tool(tool_name, arguments)
-
-
-class LocalCalendarMCP:
-    """Create importable ICS events without a third-party calendar API."""
-
-    def __init__(
-        self,
-        events_path: str = "data/calendar/events.json",
-        ics_dir: str = "data/calendar/ics",
-        timezone_name: str = "Asia/Shanghai",
-    ) -> None:
-        self.events_path = Path(get_project_abs_path(events_path))
-        self.ics_dir = Path(get_project_abs_path(ics_dir))
-        try:
-            self.timezone = ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError:
-            self.timezone = timezone.utc
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        if tool_name != "create_event":
-            return ToolResult(
-                tool_name=f"calendar.{tool_name}",
-                success=False,
-                message=f"Unknown local calendar tool: {tool_name}",
-            )
-        try:
-            return self.create_event(arguments)
-        except (OSError, TypeError, ValueError) as exc:
-            return ToolResult(
-                tool_name="calendar.create_event",
-                success=False,
-                data={"error": str(exc)},
-                message="本地日历事件生成失败。",
-            )
-
-    def create_event(self, arguments: dict[str, Any]) -> ToolResult:
-        ticket = arguments.get("ticket") or {}
-        slots = arguments.get("slots") or {}
-        event_id = str(uuid.uuid4())
-
-        start_at = self._resolve_start(ticket, slots)
-        end_at = self._resolve_end(ticket, slots, start_at)
-        movie = ticket.get("movieName") or slots.get("movieName") or "电影"
-        cinema = ticket.get("cinemaName") or slots.get("cinemaName") or "影院"
-        hall = ticket.get("hallName") or slots.get("hallName") or ""
-        address = ticket.get("address") or slots.get("address") or ""
-        seats = ticket.get("seats") or slots.get("seatIds") or []
-        if isinstance(seats, list):
-            seat_text = ",".join(str(item) for item in seats)
-        else:
-            seat_text = str(seats)
-
-        event = {
-            "id": event_id,
-            "summary": f"{movie} 观影",
-            "movie": movie,
-            "cinema": cinema,
-            "hall": hall,
-            "address": address,
-            "seats": seat_text,
-            "start_at": start_at.isoformat(),
-            "end_at": end_at.isoformat(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "created",
-        }
-
-        events = self._read_events()
-        events.append(event)
-        self._write_events(events)
-
-        ics_path = self.ics_dir / f"{event_id}.ics"
-        ics_path.parent.mkdir(parents=True, exist_ok=True)
-        ics_path.write_text(self._to_ics(event), encoding="utf-8")
-
-        return ToolResult(
-            tool_name="calendar.create_event",
-            success=True,
-            data={
-                "calendarEventId": event_id,
-                "eventsPath": str(self.events_path),
-                "icsPath": str(ics_path),
-                "event": event,
-            },
-            message="已生成本地观影日历文件。",
-        )
-
-    def _resolve_start(
-        self,
-        ticket: dict[str, Any],
-        slots: dict[str, Any],
-    ) -> datetime:
-        direct_value = ticket.get("startAt") or slots.get("startAt")
-        parsed = self._parse_datetime(direct_value)
-        if parsed:
-            return parsed
-
-        date_value = slots.get("date") or ticket.get("date") or "today"
-        time_value = (
-            slots.get("timeRange")
-            or slots.get("time")
-            or ticket.get("time")
-            or "20:00"
-        )
-        local_date = self._parse_date(date_value)
-        hour, minute = self._parse_clock(time_value)
-        return datetime(
-            local_date.year,
-            local_date.month,
-            local_date.day,
-            hour,
-            minute,
-            tzinfo=self.timezone,
-        )
-
-    def _resolve_end(
-        self,
-        ticket: dict[str, Any],
-        slots: dict[str, Any],
-        start_at: datetime,
-    ) -> datetime:
-        direct_value = ticket.get("endAt") or slots.get("endAt")
-        parsed = self._parse_datetime(direct_value)
-        if parsed:
-            return parsed
-        duration = ticket.get("durationMinutes") or slots.get("durationMinutes") or 150
-        return start_at + timedelta(minutes=int(duration))
-
-    def _parse_datetime(self, value: Any) -> datetime | None:
-        if not value:
-            return None
-        if isinstance(value, datetime):
-            return value if value.tzinfo else value.replace(tzinfo=self.timezone)
-        if not isinstance(value, str):
-            return None
-        normalized = value.strip().replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=self.timezone)
-
-    def _parse_date(self, value: Any):
-        now = datetime.now(self.timezone)
-        if isinstance(value, datetime):
-            return value.date()
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"today", "今天", "今晚"}:
-                return now.date()
-            if normalized in {"tomorrow", "明天", "明晚"}:
-                return (now + timedelta(days=1)).date()
-            if normalized in {"weekend", "周末"}:
-                days_until_saturday = (5 - now.weekday()) % 7
-                return (now + timedelta(days=days_until_saturday)).date()
-            try:
-                return datetime.strptime(normalized, "%Y-%m-%d").date()
-            except ValueError:
-                pass
-        return now.date()
-
-    def _parse_clock(self, value: Any) -> tuple[int, int]:
-        if isinstance(value, str):
-            match = re.search(r"(\d{1,2})(?::|点)(\d{1,2})?", value)
-            if match:
-                hour = int(match.group(1))
-                minute = int(match.group(2) or 0)
-                if "下午" in value or "晚上" in value or "晚" in value:
-                    if hour < 12:
-                        hour += 12
-                return min(hour, 23), min(minute, 59)
-            normalized = value.lower()
-            if normalized in {"morning", "上午"}:
-                return 10, 0
-            if normalized in {"afternoon", "下午"}:
-                return 14, 0
-            if normalized in {"evening", "晚上"}:
-                return 19, 30
-        return 20, 0
-
-    def _read_events(self) -> list[dict[str, Any]]:
-        if not self.events_path.exists():
-            return []
-        with self.events_path.open(encoding="utf-8") as file:
-            data = json.load(file)
-        if not isinstance(data, list):
-            raise ValueError(f"Calendar events must be a JSON array: {self.events_path}")
-        return data
-
-    def _write_events(self, events: list[dict[str, Any]]) -> None:
-        self.events_path.parent.mkdir(parents=True, exist_ok=True)
-        self.events_path.write_text(
-            json.dumps(events, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    def _to_ics(self, event: dict[str, Any]) -> str:
-        start = self._to_utc(event["start_at"])
-        end = self._to_utc(event["end_at"])
-        location = ", ".join(
-            item for item in [event.get("cinema"), event.get("address")] if item
-        )
-        description = (
-            f"电影：{event.get('movie', '')}\\n"
-            f"影厅：{event.get('hall', '')}\\n"
-            f"座位：{event.get('seats', '')}"
-        )
-        lines = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            "PRODID:-//Movie Ticket Agent//CN",
-            "CALSCALE:GREGORIAN",
-            "METHOD:PUBLISH",
-            "BEGIN:VEVENT",
-            f"UID:{event['id']}@movie-ticket-agent",
-            f"DTSTAMP:{self._utc_now()}",
-            f"DTSTART:{start}",
-            f"DTEND:{end}",
-            f"SUMMARY:{self._ics_escape(event.get('summary', '观影'))}",
-            f"LOCATION:{self._ics_escape(location)}",
-            f"DESCRIPTION:{self._ics_escape(description)}",
-            "END:VEVENT",
-            "END:VCALENDAR",
-        ]
-        return "\r\n".join(lines) + "\r\n"
-
-    def _to_utc(self, value: str) -> str:
-        parsed = self._parse_datetime(value)
-        if not parsed:
-            raise ValueError(f"Invalid calendar datetime: {value}")
-        return parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    def _utc_now(self) -> str:
-        return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    def _ics_escape(self, value: str) -> str:
-        return (
-            str(value)
-            .replace("\\", "\\\\")
-            .replace(";", "\\;")
-            .replace(",", "\\,")
-            .replace("\r\n", "\\n")
-            .replace("\n", "\\n")
-        )
-
-
-class AppleCalDAVMCP(LocalCalendarMCP):
-    """Upload generated ICS events to an iCloud calendar through CalDAV."""
-
-    def __init__(
-        self,
-        username: str,
-        app_password: str,
-        calendar_name: str = "",
-        server_url: str = "https://caldav.icloud.com/",
-        events_path: str = "data/calendar/events.json",
-        ics_dir: str = "data/calendar/ics",
-        timezone_name: str = "Asia/Shanghai",
-    ) -> None:
-        super().__init__(
-            events_path=events_path,
-            ics_dir=ics_dir,
-            timezone_name=timezone_name,
-        )
-        self.username = username
-        self.app_password = app_password
-        self.calendar_name = calendar_name
-        self.server_url = server_url
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        if tool_name != "create_event":
-            return ToolResult(
-                tool_name=f"calendar.{tool_name}",
-                success=False,
-                message=f"Unknown iCloud calendar tool: {tool_name}",
-            )
-        try:
-            return self.create_event(arguments)
-        except Exception as exc:
-            return ToolResult(
-                tool_name="calendar.create_event",
-                success=False,
-                data={"error": str(exc)},
-                message="iCloud 日历同步失败，请检查 CalDAV 配置和 App 专用密码。",
-            )
-
-    def create_event(self, arguments: dict[str, Any]) -> ToolResult:
-        if not self.username or not self.app_password:
-            raise ValueError(
-                "Missing APPLE_CALDAV_USERNAME or APPLE_CALDAV_APP_PASSWORD."
-            )
-
-        result = super().create_event(arguments)
-        ics_path = Path(result.data["icsPath"])
-        remote = self._upload_ics(ics_path)
-        result.data["remote"] = remote
-        result.message = "观影日程已生成并同步到 iCloud 日历。"
-        return result
-
-    def _upload_ics(self, ics_path: Path) -> dict[str, Any]:
-        try:
-            from caldav import get_davclient
-        except ImportError as exc:
-            raise RuntimeError(
-                "未安装 caldav，请执行 .\\.venv\\Scripts\\python.exe -m pip install caldav"
-            ) from exc
-
-        with get_davclient(
-            url=self.server_url,
-            username=self.username,
-            password=self.app_password,
-            features="icloud",
-        ) as client:
-            principal = client.principal()
-            calendars = principal.get_calendars()
-            if not calendars:
-                raise RuntimeError("iCloud 账户下没有可用日历。")
-
-            calendar = self._select_calendar(calendars)
-            remote_event = calendar.add_event(
-                ics_path.read_text(encoding="utf-8")
-            )
-            return {
-                "calendarName": getattr(calendar, "name", self.calendar_name),
-                "eventUrl": str(getattr(remote_event, "url", "") or ""),
-            }
-
-    def _select_calendar(self, calendars: list[Any]) -> Any:
-        if self.calendar_name:
-            wanted = self.calendar_name.casefold()
-            for calendar in calendars:
-                name = str(getattr(calendar, "name", "") or "")
-                if name.casefold() == wanted:
-                    return calendar
-            raise RuntimeError(f"找不到 iCloud 日历：{self.calendar_name}")
-        return calendars[0]
-
-
-class LocalSmsOutboxMCP:
-    def __init__(
-        self,
-        outbox_path: str = "data/notifications/sms_outbox.json",
-    ) -> None:
-        self.outbox_path = Path(get_project_abs_path(outbox_path))
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        if tool_name not in {"send_sms", "send_ticket_message"}:
-            return ToolResult(
-                tool_name=f"notification.{tool_name}",
-                success=False,
-                message=f"Unknown notification MCP tool: {tool_name}",
-            )
-
-        try:
-            return self.write_sms(arguments)
-        except (OSError, ValueError) as exc:
-            return ToolResult(
-                tool_name=f"notification.{tool_name}",
-                success=False,
-                data={"error": str(exc)},
-                message="Local SMS outbox write failed.",
-            )
-
-    def write_sms(self, arguments: dict[str, Any]) -> ToolResult:
-        phone = arguments.get("phone") or arguments.get("phoneNumber") or arguments.get("to")
-        if not phone:
-            raise ValueError("Missing phone number for SMS.")
-
-        template_params = (
-            arguments.get("template_params")
-            or arguments.get("templateParam")
-            or self._ticket_template_params(arguments)
-        )
-        message = arguments.get("message") or self._render_message(template_params)
-        record = {
-            "id": str(uuid.uuid4()),
-            "channel": "sms",
-            "phone": str(phone),
-            "message": message,
-            "template_params": template_params,
-            "status": "pending",
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-
-        outbox = self._read_outbox()
-        outbox.append(record)
-        self._write_outbox(outbox)
-
-        return ToolResult(
-            tool_name="notification.send_sms",
-            success=True,
-            data={
-                "notificationId": record["id"],
-                "phone": phone,
-                "outbox_path": str(self.outbox_path),
-                "record": record,
-            },
-            message="SMS saved to local outbox.",
-        )
-
-    def _read_outbox(self) -> list[dict[str, Any]]:
-        if not self.outbox_path.exists():
-            return []
-        with self.outbox_path.open(encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            raise ValueError(f"SMS outbox must contain a JSON array: {self.outbox_path}")
-        return data
-
-    def _write_outbox(self, outbox: list[dict[str, Any]]) -> None:
-        self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.outbox_path.open("w", encoding="utf-8") as f:
-            json.dump(outbox, f, ensure_ascii=False, indent=2)
-
-    def _render_message(self, params: dict[str, Any]) -> str:
-        movie = params.get("movie") or "电影"
-        cinema = params.get("cinema") or "影院"
-        showtime = params.get("time") or "观影时间"
-        seats = params.get("seats") or "座位"
-        return f"您已成功出票：{movie}，{cinema}，{showtime}，座位：{seats}。请准时观影。"
-
-    def _ticket_template_params(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        ticket = arguments.get("ticket") or {}
-        slots = arguments.get("slots") or {}
-        return {
-            "movie": slots.get("movieName") or ticket.get("movieName") or "电影",
-            "cinema": slots.get("cinemaName") or ticket.get("cinemaName") or "影院",
-            "time": slots.get("timeRange") or ticket.get("time") or "观影时间",
-            "seats": ",".join(slots.get("seatIds", [])) if isinstance(slots.get("seatIds"), list) else slots.get("seatIds", ""),
-        }
-
-
 class MCPDispatcher:
     def __init__(self) -> None:
         mcp_settings = agent_config.get("mcp", {})
         self.clients: dict[str, MCPClient] = {
-            "movie_ticket": LocalMovieTicketMCP(),
             "spring_boot": self._spring_boot_client(),
-            "snack": LocalSnackMCP(),
-            "coupon": LocalCouponMCP(),
             "amap": self._amap_client(mcp_settings),
-            "calendar": self._calendar_client(mcp_settings),
-            "notification": self._notification_client(mcp_settings),
         }
 
     def call(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
@@ -2138,15 +1269,6 @@ class MCPDispatcher:
                 message=f"MCP server is not registered: {server_name}",
             )
         return client.call_tool(tool_name, arguments)
-
-    def _http_client(self, server_name: str, settings: dict[str, Any]) -> HttpMCPClient:
-        server_settings = settings.get(server_name, {})
-        return HttpMCPClient(
-            server_name=server_name,
-            base_url=server_settings.get("base_url"),
-            token_env=server_settings.get("token_env"),
-            timeout_seconds=server_settings.get("timeout_seconds", 15),
-        )
 
     def _amap_client(self, settings: dict[str, Any]) -> AMapMCP:
         server_settings = settings.get("amap", {})
@@ -2162,78 +1284,6 @@ class MCPDispatcher:
             base_url=server_settings.get("base_url") or "http://localhost:8080",
             timeout_seconds=server_settings.get("timeout_seconds", 15),
         )
-
-    def _calendar_client(self, settings: dict[str, Any]) -> MCPClient:
-        server_settings = settings.get("calendar", {})
-        provider = server_settings.get("provider", "local_ics")
-        if provider == "local_ics":
-            return LocalCalendarMCP(
-                events_path=server_settings.get(
-                    "events_path",
-                    "data/calendar/events.json",
-                ),
-                ics_dir=server_settings.get(
-                    "ics_dir",
-                    "data/calendar/ics",
-                ),
-                timezone_name=server_settings.get(
-                    "timezone",
-                    "Asia/Shanghai",
-                ),
-            )
-        if provider == "apple_caldav":
-            return AppleCalDAVMCP(
-                username=os.getenv(
-                    server_settings.get(
-                        "username_env",
-                        "APPLE_CALDAV_USERNAME",
-                    ),
-                    "",
-                ),
-                app_password=os.getenv(
-                    server_settings.get(
-                        "app_password_env",
-                        "APPLE_CALDAV_APP_PASSWORD",
-                    ),
-                    "",
-                ),
-                calendar_name=os.getenv(
-                    server_settings.get(
-                        "calendar_name_env",
-                        "APPLE_CALDAV_CALENDAR_NAME",
-                    ),
-                    "",
-                ),
-                server_url=server_settings.get(
-                    "server_url",
-                    "https://caldav.icloud.com/",
-                ),
-                events_path=server_settings.get(
-                    "events_path",
-                    "data/calendar/events.json",
-                ),
-                ics_dir=server_settings.get(
-                    "ics_dir",
-                    "data/calendar/ics",
-                ),
-                timezone_name=server_settings.get(
-                    "timezone",
-                    "Asia/Shanghai",
-                ),
-            )
-        return CalendarMCP(self._http_client("calendar", settings))
-
-    def _notification_client(self, settings: dict[str, Any]) -> MCPClient:
-        server_settings = settings.get("notification", {})
-        provider = server_settings.get("provider", "local_sms_outbox")
-        if provider == "local_sms_outbox":
-            return LocalSmsOutboxMCP(
-                outbox_path=server_settings.get(
-                    "outbox_path",
-                    "data/notifications/sms_outbox.json",
-                )
-            )
-        return NotificationMCP(self._http_client("notification", settings))
 
 
 mcp_dispatcher = MCPDispatcher()

@@ -25,7 +25,6 @@ CARD_TYPE_MAP = {
     "alternative": "ALTERNATIVE",
     "location_picker": "LOCATION_PICKER",
     "snack": "SNACK_LIST",
-    "coupon": "COUPON_LIST",
 }
 
 NODE_THINKING = {

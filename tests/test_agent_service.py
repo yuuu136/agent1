@@ -1,6 +1,8 @@
 from fastapi.testclient import TestClient
 
+from app.agent.cards import card_builder
 from app.main import app
+from app.schemas.agent import AgentPlan, ToolResult
 
 
 class MockSpringNearbyResponse:
@@ -29,7 +31,7 @@ class MockSpringNearbyResponse:
         }
 
 
-def test_chat_booking_text_returns_showtime_cards() -> None:
+def test_chat_booking_text_requires_login_for_real_ticketing() -> None:
     client = TestClient(app)
 
     response = client.post(
@@ -51,7 +53,8 @@ def test_chat_booking_text_returns_showtime_cards() -> None:
     payload = response.json()
     assert response.status_code == 200
     assert payload["state"] == "selecting_showtime"
-    assert payload["cards"][0]["type"] == "showtime"
+    assert payload["cards"] == []
+    assert payload["message"] == "请先登录后再使用真实票务服务。"
 
 
 def test_chat_empty_new_session_returns_greeting() -> None:
@@ -87,6 +90,32 @@ def test_stream_greeting_ignores_frontend_draft_context() -> None:
     assert response.status_code == 200
     assert '"state": "greeting"' in response.text
     assert "event: done" in response.text
+
+
+def test_movie_card_includes_poster_payload_for_frontend_card_face() -> None:
+    cards = card_builder.build(
+        AgentPlan(action="search_movies", state="selecting_movie"),
+        ToolResult(
+            tool_name="spring_boot.search_movies",
+            data={
+                "movies": [
+                    {
+                        "movieId": 8,
+                        "movieName": "蜘蛛侠",
+                        "genre": "动作",
+                        "score": 9.1,
+                        "posterUrl": "https://example.com/spider.jpg",
+                    }
+                ]
+            },
+        ),
+    )
+
+    assert cards[0]["type"] == "movie"
+    assert cards[0]["title"] == "蜘蛛侠"
+    assert cards[0]["image"] == "https://example.com/spider.jpg"
+    assert cards[0]["posterUrl"] == "https://example.com/spider.jpg"
+    assert cards[0]["payload"]["posterUrl"] == "https://example.com/spider.jpg"
 
 
 def test_chat_nearby_cinema_uses_spring_database_nearby_api(monkeypatch) -> None:
@@ -140,7 +169,7 @@ def test_chat_nearby_cinema_does_not_fallback_to_an_unknown_city() -> None:
     assert "当前位置" in payload["message"]
 
 
-def test_select_showtime_returns_seat_map() -> None:
+def test_select_showtime_requires_login_for_real_seat_map() -> None:
     client = TestClient(app)
 
     response = client.post(
@@ -155,10 +184,11 @@ def test_select_showtime_returns_seat_map() -> None:
     payload = response.json()
     assert response.status_code == 200
     assert payload["state"] == "selecting_seats"
-    assert payload["cards"][0]["type"] == "seat_map"
+    assert payload["cards"] == []
+    assert payload["message"] == "请先登录后再使用真实票务服务。"
 
 
-def test_confirm_order_locks_seats_and_creates_order() -> None:
+def test_confirm_order_requires_login_for_real_lock() -> None:
     client = TestClient(app)
 
     response = client.post(
@@ -173,8 +203,8 @@ def test_confirm_order_locks_seats_and_creates_order() -> None:
     payload = response.json()
     assert response.status_code == 200
     assert payload["state"] == "locking_seats"
-    assert payload["session"]["slots"]["orderId"].startswith("ord_")
-    assert payload["cards"][0]["type"] == "confirm_order"
+    assert payload["cards"] == []
+    assert payload["message"] == "请先登录后再使用真实票务服务。"
 
 
 def test_stream_chat_returns_sse_events() -> None:
@@ -197,7 +227,7 @@ def test_stream_chat_returns_sse_events() -> None:
     assert '"node": "planner"' in response.text
 
 
-def test_full_movie_ticket_flow_reaches_payment_qr_card() -> None:
+def test_full_movie_ticket_flow_without_login_stops_before_database() -> None:
     client = TestClient(app)
     session_id = "agent-full-flow"
 
@@ -216,45 +246,5 @@ def test_full_movie_ticket_flow_reaches_payment_qr_card() -> None:
             },
         },
     ).json()
-    showtime = showtime_response["cards"][0]["id"]
-
-    client.post(
-        "/agent/chat",
-        json={
-            "sessionId": session_id,
-            "event": "select_showtime",
-            "payload": {"showtimeId": showtime, "ticketCount": 2},
-        },
-    )
-
-    order_response = client.post(
-        "/agent/chat",
-        json={
-            "sessionId": session_id,
-            "event": "confirm_order",
-            "payload": {
-                "showtimeId": showtime,
-                "seatIds": ["A1", "A2"],
-                "ticketCount": 2,
-            },
-        },
-    ).json()
-    order_id = order_response["session"]["slots"]["orderId"]
-
-    pay_response = client.post(
-        "/agent/chat",
-        json={
-            "sessionId": session_id,
-            "event": "pay_order",
-            "payload": {"orderId": order_id},
-        },
-    ).json()
-
-    first_card = pay_response["cards"][0]
-    assert first_card["type"] in {"payment", "ticket"}
-    if first_card["type"] == "payment":
-        assert first_card["qrCode"]
-        assert pay_response["message"] == "支付二维码已生成，请扫码支付。"
-    else:
-        assert first_card["meta"]["ticketStatus"] == "issued"
-        assert pay_response["message"] in {"支付成功。", "支付成功，电子票已出票。"}
+    assert showtime_response["cards"] == []
+    assert showtime_response["message"] == "请先登录后再使用真实票务服务。"

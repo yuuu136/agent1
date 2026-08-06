@@ -47,7 +47,8 @@ class ReferenceResolver:
                 self._clear_downstream_selection(slots)
             if self._is_change_cinema(text):
                 slots["changeCinema"] = True
-                slots["__clearSlots"] = [
+                self._add_clear_slots(
+                    slots,
                     "cinemaId",
                     "cinemaName",
                     "showtimeId",
@@ -58,20 +59,38 @@ class ReferenceResolver:
                     "couponId",
                     "snackIds",
                     "price",
-                ]
+                )
             if "还是老位置" in text:
                 slots["seatPreference"] = state.slots.get("seatPreference", "middle")
+
+        if self._is_negative_hall_type_request(text):
+            slots.pop("hallType", None)
+            self._add_clear_slots(slots, "hallType")
+            if self._has_downstream_selection(state):
+                self._clear_downstream_selection(slots)
+
+        if self._is_plain_hall_type_request(text):
+            slots.pop("hallType", None)
+            self._add_clear_slots(slots, "hallType")
+            if self._has_downstream_selection(state):
+                self._clear_downstream_selection(slots)
+
+        if "ticketCount" in slots:
+            self._normalize_ticket_count_change(state, slots, text)
 
         if self._is_change_showtime(text):
             slots["changeShowtime"] = True
             self._clear_downstream_selection(slots)
 
-        if nlu.intent == "seat_query" and slots.get("seatPositions"):
-            # A seat replacement keeps the selected showtime, but invalidates
+        if nlu.intent == "seat_query" and (
+            slots.get("seatPositions") or self._is_change_seat_request(text)
+        ):
+            # Seat replacement keeps the selected showtime, but invalidates
             # any previous seat lock or order draft.
             self._add_clear_slots(
                 slots,
                 "seatIds",
+                "seatPositions",
                 "orderId",
                 "lockId",
                 "couponId",
@@ -112,19 +131,123 @@ class ReferenceResolver:
         return nlu.model_copy(update={"intent": intent, "slots": slots})
 
     def _clear_downstream_selection(self, slots: dict[str, Any]) -> None:
-        slots["__clearSlots"] = [
+        self._add_clear_slots(
+            slots,
             "showtimeId",
             "seatIds",
             "seatPositions",
             "orderId",
             "lockId",
-                "couponId",
-                "snackIds",
-                "price",
-                "amount",
-                "status",
-                "expiresAt",
+            "couponId",
+            "snackIds",
+            "price",
+            "amount",
+            "status",
+            "expiresAt",
+        )
+
+    def _normalize_ticket_count_change(
+        self,
+        state: AgentState,
+        slots: dict[str, Any],
+        text: str,
+    ) -> None:
+        old_count = self._positive_int(state.slots.get("ticketCount"))
+        new_count = self._positive_int(slots.get("ticketCount"))
+        if new_count is None:
+            return
+        if self._is_increment_ticket_count(text) and old_count is not None:
+            new_count = old_count + new_count
+            slots["ticketCount"] = new_count
+        elif self._is_decrement_ticket_count(text) and old_count is not None:
+            new_count = max(1, old_count - new_count)
+            slots["ticketCount"] = new_count
+        if (
+            old_count is not None
+            and new_count != old_count
+            and self._has_downstream_selection(state)
+        ):
+            self._clear_downstream_selection(slots)
+
+    def _is_increment_ticket_count(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text)
+        return any(
+            marker in normalized
+            for marker in ["再加", "多加", "增加", "加一", "加两", "加俩", "加2", "加1"]
+        )
+
+    def _is_decrement_ticket_count(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text)
+        return any(marker in normalized for marker in ["减", "少一", "少两", "少俩"])
+
+    def _has_downstream_selection(self, state: AgentState) -> bool:
+        downstream_slots = {
+            "showtimeId",
+            "seatIds",
+            "seatPositions",
+            "orderId",
+            "lockId",
+            "couponId",
+            "snackIds",
+            "price",
+            "amount",
+            "status",
+            "expiresAt",
+        }
+        if any(key in state.slots for key in downstream_slots):
+            return True
+        return any(
+            key in state.selected
+            for key in [
+                "showtime_candidates",
+                "seat_map",
+                "order",
+                "ticket",
+                "coupon_candidates",
+                "snack_candidates",
             ]
+        )
+
+    def _is_negative_hall_type_request(self, text: str) -> bool:
+        upper_text = text.upper()
+        has_hall_type = any(hall in upper_text for hall in ["IMAX"]) or any(
+            hall in text for hall in ["杜比", "巨幕", "激光"]
+        )
+        if not has_hall_type:
+            return False
+        normalized = re.sub(r"\s+", "", text)
+        return any(
+            marker in normalized
+            for marker in ["不要", "不想要", "不需要", "不用", "别要", "不看"]
+        )
+
+    def _is_plain_hall_type_request(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text)
+        return any(
+            phrase in normalized
+            for phrase in [
+                "普通厅",
+                "普通场",
+                "普通版",
+                "普通2D",
+                "2D就行",
+                "换普通",
+                "改普通",
+            ]
+        )
+
+    def _is_change_seat_request(self, text: str) -> bool:
+        return any(word in text for word in ["座位", "选座", "位置"]) and any(
+            word in text
+            for word in ["换", "改", "重新", "重选", "不要这个", "不要当前", "不想要这个"]
+        )
+
+    def _positive_int(self, value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
 
     def _is_change_cinema(self, text: str) -> bool:
         return any(

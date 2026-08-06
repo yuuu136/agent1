@@ -81,6 +81,9 @@ CANCEL_TEXTS = {
     "先不买",
     "不买了",
     "别买了",
+    "不要了",
+    "先不要了",
+    "暂时不要了",
 }
 SHOWTIME_QUERY_TEXTS = {
     "有什么场次",
@@ -146,7 +149,22 @@ NON_MOVIE_TEXTS = GREETING_TEXTS | ACK_TEXTS | SHOWTIME_QUERY_TEXTS | {
     "换座位",
     "更换座位",
 }
-MOVIE_SEARCH_TEXTS = {"最近热映", "正在上映", "有什么电影", "推荐电影"}
+MOVIE_SEARCH_TEXTS = {
+    "最近热映",
+    "正在上映",
+    "有什么电影",
+    "有啥电影",
+    "有哪些电影",
+    "有些什么电影",
+    "有什么影片",
+    "有啥影片",
+    "有哪些影片",
+    "有些什么影片",
+    "推荐电影",
+    "推荐影片",
+    "看看电影",
+    "查电影",
+}
 PRICE_QUERY_MARKERS = (
     "多少钱",
     "多少元",
@@ -158,6 +176,51 @@ PRICE_QUERY_MARKERS = (
     "单价",
     "费用",
     "贵不贵",
+)
+ORDER_QUERY_PHRASES = (
+    "查看订单",
+    "查订单",
+    "查询订单",
+    "看看订单",
+    "我的订单",
+    "订单详情",
+    "订单记录",
+    "历史订单",
+    "付款了吗",
+    "支付了吗",
+    "付钱了吗",
+    "支付状态",
+    "付款状态",
+    "支付结果",
+    "付款结果",
+)
+LOCATION_QUERY_PHRASES = (
+    "我的地理位置",
+    "我现在的具体位置",
+    "我的具体位置",
+    "我现在的位置",
+    "我的当前位置",
+    "当前位置",
+    "当前定位",
+    "定位信息",
+    "我的位置",
+    "现在在哪里",
+    "现在在哪",
+    "现在在哪儿",
+    "当前位置在哪里",
+    "当前位置在哪",
+    "当前位置在哪儿",
+    "这里是哪里",
+    "这里在哪",
+    "这里在哪儿",
+    "这是哪里",
+    "这是哪儿",
+    "我在哪里",
+    "我在哪",
+    "我在哪儿",
+    "我的坐标",
+    "当前坐标",
+    "经纬度",
 )
 PRICE_PREFERENCE_MARKERS = (
     "便宜",
@@ -191,6 +254,9 @@ GENERIC_BOOKING_TEXTS = {
     "movie tickets",
     "tickets",
 }
+IMPLICIT_SINGLE_TICKET_PATTERN = re.compile(
+    r"(?:购买|预订|买|订|来)\s*张"
+)
 
 
 def _normalize_short_text(text: str) -> str:
@@ -251,6 +317,7 @@ class RuleBasedNLU:
                 "select_cinema": "select_or_modify",
                 "select_showtime": "select_showtime",
                 "navigate": "select_showtime",
+                "get_current_location": "location_query",
                 "select_seats": "confirm_order",
                 "select_snacks": "select_snacks",
                 "select_coupon": "select_coupon",
@@ -271,21 +338,29 @@ class RuleBasedNLU:
             return "skip_snacks"
         if self._is_negative_coupon_request(text):
             return "skip_coupon"
+        if self._is_order_query_text(text):
+            return "order_query"
         if any(word in text for word in ["退票", "改签", "规则", "政策", "怎么处理", "FAQ"]):
             return "faq"
         if self._is_price_preference_text(text):
             return "select_or_modify"
         if any(marker in text for marker in PRICE_QUERY_MARKERS):
             return "price_query"
-        if any(word in text for word in ["热映", "正在上映", "有什么电影", "推荐电影"]):
+        if self._is_movie_keyword_query(text):
+            return "search_movies"
+        if self._is_movie_search_text(text):
             return "search_movies"
         if any(word in text for word in ["附近", "最近", "周边", "离我近", "高德", "地图"]):
             return "nearby_cinema"
         if any(word in lowered for word in ["nearby", "around me", "map", "amap"]):
             return "nearby_cinema"
+        if self._is_location_query_text(text):
+            return "location_query"
         if self._is_seat_only_request(text):
             return "seat_query"
         payload_slots = payload.get("slots", {})
+        if self._is_plain_hall_type_request(text):
+            return "select_or_modify"
         if any(
             key in payload or key in payload_slots
             for key in [
@@ -367,7 +442,12 @@ class RuleBasedNLU:
 
         hall_type = self._extract_hall_type(text)
         if hall_type:
-            slots["hallType"] = hall_type
+            if self._is_negative_hall_type_request(text):
+                self._add_clear_slots(slots, "hallType")
+            else:
+                slots["hallType"] = hall_type
+        elif self._is_plain_hall_type_request(text):
+            self._add_clear_slots(slots, "hallType")
         if self._is_price_preference_text(text):
             slots["pricePreference"] = "lower"
         if self._is_time_preference_text(text):
@@ -376,9 +456,13 @@ class RuleBasedNLU:
         movie_name = payload.get("movieName") or payload.get("movie_name")
         if movie_name:
             slots["movieName"] = movie_name
+        elif intent == "search_movies":
+            movie_keyword = self._extract_movie_search_keyword(text)
+            if movie_keyword:
+                slots["movieName"] = movie_keyword
         elif (
             not genre
-            and text.strip() not in MOVIE_SEARCH_TEXTS
+            and not self._is_movie_search_text(text)
             and self._should_extract_movie_name(event, intent, text)
             and not self._is_seat_only_request(text)
         ):
@@ -417,7 +501,7 @@ class RuleBasedNLU:
 
         clear_slots = self._clear_slots_for_event(event)
         if clear_slots:
-            slots["__clearSlots"] = clear_slots
+            self._add_clear_slots(slots, *clear_slots)
 
         if event == "select_snacks" and slots.get("snackId"):
             slots["snackIds"] = [slots["snackId"]]
@@ -428,6 +512,10 @@ class RuleBasedNLU:
 
     def _should_extract_movie_name(self, event: str | None, intent: str, text: str) -> bool:
         if text.strip().casefold() in GENERIC_BOOKING_TEXTS:
+            return False
+        if self._is_ticket_count_only_request(text):
+            return False
+        if self._is_negative_hall_type_request(text) or self._is_plain_hall_type_request(text):
             return False
         if self._is_seat_only_request(text):
             return False
@@ -512,6 +600,8 @@ class RuleBasedNLU:
         )
         if chinese_match:
             return self._parse_chinese_number(chinese_match.group(1))
+        if IMPLICIT_SINGLE_TICKET_PATTERN.search(text):
+            return 1
         return None
 
     def _parse_chinese_number(self, value: str) -> int | None:
@@ -615,6 +705,10 @@ class RuleBasedNLU:
             return None
         if self._is_ticket_count_only_request(text):
             return None
+        if self._is_ticket_count_change_request(text):
+            return None
+        if self._is_negative_hall_type_request(text) or self._is_plain_hall_type_request(text):
+            return None
         if self._is_seat_only_request(text):
             return None
         if self._extract_ordinal_text(text) is not None:
@@ -629,6 +723,14 @@ class RuleBasedNLU:
             flags=re.IGNORECASE,
         )
         value = re.sub(r"^(?:给我|帮我|我想|想|我要|请|麻烦你?)", "", value)
+        # "买张/订张" is colloquial shorthand for buying one ticket. Remove
+        # the classifier before extracting the movie title, otherwise it leaks
+        # into queries such as "张功夫女足".
+        value = re.sub(
+            r"^(?:购买|预订|买|订|来)\s*张",
+            "",
+            value,
+        )
         value = re.sub(
             r"^(?:选择|看看|看一下|查一下|查询|查看|查|买|订|预订|购买|来|看|选|找)+",
             "",
@@ -777,7 +879,8 @@ class RuleBasedNLU:
     def _is_ticket_count_only_request(self, text: str) -> bool:
         normalized = re.sub(r"[\s，。,.!?！？]+", "", text)
         normalized = re.sub(
-            r"^(?:给我|帮我|我想|我要|请|麻烦你?)(?:买|订|预订|购买|来)?",
+            r"^(?:给我|帮我|我想|我要|请|麻烦你?)?"
+            r"(?:买|订|预订|购买|来|再加|加|多加|增加|添|改成|改为|换成|换为)?",
             "",
             normalized,
         )
@@ -794,6 +897,8 @@ class RuleBasedNLU:
             self._is_price_preference_text(text)
             or self._is_time_preference_text(text)
             or "不要" in text
+            or self._is_negative_hall_type_request(text)
+            or self._is_plain_hall_type_request(text)
             or any(
                 word in text
                 for word in [
@@ -823,18 +928,108 @@ class RuleBasedNLU:
                 "暂时不支付",
                 "不想支付",
                 "不要支付",
+                "取消支付",
+                "取消付款",
                 "不支付",
                 "先不付",
                 "暂时不付",
                 "不想付",
+                "不想付款",
+                "不付款了",
+                "不付钱了",
+                "先不付款",
+                "暂时不付款",
                 "不付了",
+                "暂时不要了",
+                "先不要了",
+                "不想要了",
                 "不想买了",
+                "不用买了",
                 "不想看了",
                 "不看了",
                 "我不要了",
                 "我不想要了",
                 "算了吧",
             ]
+        )
+
+    def _is_order_query_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        if any(phrase in normalized for phrase in ORDER_QUERY_PHRASES):
+            return True
+        return bool(
+            re.search(r"(?:查|查看|查询|看看).{0,3}订单", normalized)
+        )
+
+    def _is_movie_search_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        movie_search_values = {
+            _normalize_short_text(value) for value in MOVIE_SEARCH_TEXTS
+        }
+        return any(value in normalized for value in movie_search_values)
+
+    def _is_movie_keyword_query(self, text: str) -> bool:
+        return self._extract_movie_search_keyword(text) is not None
+
+    def _extract_movie_search_keyword(self, text: str) -> str | None:
+        normalized = _normalize_short_text(text)
+        if not normalized:
+            return None
+        if any(
+            marker in normalized
+            for marker in [
+                "买",
+                "订",
+                "购票",
+                "购买",
+                "预订",
+                "影票",
+                "电影票",
+                "几张",
+            ]
+        ):
+            return None
+        match = re.fullmatch(
+            r"(?:有没有|有无|查一下|查询|查看|看看|找一下|找)?"
+            r"(?P<keyword>[\u4e00-\u9fffA-Za-z0-9·]{2,20})"
+            r"(?:电影|影片)",
+            normalized,
+        )
+        if not match:
+            return None
+        keyword = match.group("keyword").strip()
+        if keyword in {"什么", "啥", "哪些", "一些", "些", "推荐", "热映"}:
+            return None
+        if keyword.startswith(("什么", "啥", "哪些", "有什么", "有啥", "有哪些", "有些")):
+            return None
+        return keyword
+
+    def _is_location_query_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        if any(
+            phrase in normalized
+            for phrase in ["换个位置", "换位置", "换座位", "选座", "座位"]
+        ):
+            return False
+        if any(phrase in normalized for phrase in LOCATION_QUERY_PHRASES):
+            return True
+        return bool(
+            re.search(
+                r"(?:我|当前|现在|这里|这儿|此处).{0,4}"
+                r"(?:位置|定位|坐标|经纬度|哪里|哪儿|在哪)",
+                normalized,
+            )
+        )
+
+    def _is_ticket_count_change_request(self, text: str) -> bool:
+        normalized = re.sub(r"[\s，。,.!?！？]+", "", text)
+        return bool(
+            re.fullmatch(
+                r"(?:再加|加|多加|增加|添|改成|改为|换成|换为)"
+                r"(?:\d+|[一二两三四五六七八九十俩]{1,3})"
+                r"(?:张|人|位|票)(?:电影票|影票|票)?",
+                normalized,
+            )
         )
 
     def _is_negative_snack_request(self, text: str) -> bool:
@@ -846,9 +1041,17 @@ class RuleBasedNLU:
                 "不用零食",
                 "不吃零食",
                 "不加零食",
+                "不买零食",
+                "不买零食了",
+                "零食不要",
+                "零食不要了",
                 "不要爆米花",
                 "不需要爆米花",
+                "不加爆米花",
+                "不加爆米花了",
+                "不买爆米花",
                 "不要饮料",
+                "不买饮料",
                 "不要套餐",
                 "不加套餐",
                 "不需要小吃",
@@ -863,9 +1066,14 @@ class RuleBasedNLU:
                 "不用优惠券",
                 "不使用优惠券",
                 "不要优惠券",
+                "优惠券不要",
+                "优惠券不要了",
                 "不需要优惠券",
                 "不想用券",
                 "不使用券",
+                "不用优惠",
+                "不使用优惠",
+                "不要优惠",
             ]
         )
 
@@ -874,6 +1082,46 @@ class RuleBasedNLU:
 
     def _is_time_preference_text(self, text: str) -> bool:
         return any(marker in text for marker in TIME_PREFERENCE_TEXTS)
+
+    def _is_negative_hall_type_request(self, text: str) -> bool:
+        if not self._extract_hall_type(text):
+            return False
+        normalized = re.sub(r"\s+", "", text)
+        return any(
+            marker in normalized
+            for marker in [
+                "不要",
+                "不想要",
+                "不需要",
+                "不用",
+                "别要",
+                "不要看",
+                "不看",
+            ]
+        )
+
+    def _is_plain_hall_type_request(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text)
+        return any(
+            phrase in normalized
+            for phrase in [
+                "普通厅",
+                "普通场",
+                "普通版",
+                "普通2D",
+                "2D就行",
+                "换普通",
+                "改普通",
+            ]
+        )
+
+    def _add_clear_slots(self, slots: dict[str, Any], *keys: str) -> None:
+        current = slots.get("__clearSlots")
+        clear_slots = list(current) if isinstance(current, list) else []
+        for key in keys:
+            if key not in clear_slots:
+                clear_slots.append(key)
+        slots["__clearSlots"] = clear_slots
 
     def _has_booking_slot_text(self, text: str) -> bool:
         return any(

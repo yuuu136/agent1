@@ -6,6 +6,10 @@ from app.schemas.agent import AgentPlan, ToolResult
 
 class CardBuilder:
     def build(self, plan: AgentPlan, result: ToolResult) -> list[dict[str, Any]]:
+        if not result.success:
+            return result.cards
+        if result.data.get("showSnackRecommendations") and result.data.get("snacks"):
+            return self.snack_cards(result.data.get("snacks", []))
         if result.data.get("paymentReady"):
             return self.payment_cards(result.data)
         if result.data.get("navigation"):
@@ -18,8 +22,6 @@ class CardBuilder:
             return self.seat_cards(result.data)
         if plan.action == "recommend_snacks":
             return self.snack_cards(result.data.get("snacks", []))
-        if plan.action == "recommend_coupons":
-            return self.coupon_cards(result.data.get("coupons", []))
         if plan.action == "search_nearby_cinemas":
             return self.cinema_cards(result.data.get("cinemas", []))
         if plan.action == "confirm_selection":
@@ -32,6 +34,11 @@ class CardBuilder:
             if result.data.get("ticketStatus") == "issued":
                 return self.ticket_cards(result.data)
             return self.payment_cards(result.data)
+        if plan.action == "get_order":
+            return self.order_cards([result.data]) if result.data else []
+        if plan.action == "list_orders":
+            records = result.data.get("records", [])
+            return self.order_cards(records)
         return result.cards
 
     def movie_cards(self, movies: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -40,10 +47,16 @@ class CardBuilder:
                 "type": "movie",
                 "id": item.get("movieId"),
                 "title": item.get("movieName"),
+                "image": item.get("posterUrl") or item.get("poster") or item.get("image"),
+                "poster": item.get("poster") or item.get("posterUrl") or item.get("image"),
+                "posterUrl": item.get("posterUrl") or item.get("poster") or item.get("image"),
                 "meta": {
                     "genre": item.get("genre"),
                     "score": item.get("score"),
+                    "duration": item.get("durationMinutes"),
+                    "status": item.get("status"),
                 },
+                "payload": item,
                 "actions": [
                     {
                         "event": "select_movie",
@@ -120,18 +133,6 @@ class CardBuilder:
             for item in snacks
         ]
 
-    def coupon_cards(self, coupons: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "coupon",
-                "id": item.get("couponId"),
-                "title": item.get("name"),
-                "meta": {"discount": item.get("discount")},
-                "actions": [{"event": "select_coupon", "label": "使用优惠", "payload": item}],
-            }
-            for item in coupons
-        ]
-
     def cinema_cards(self, cinemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
             {
@@ -194,6 +195,21 @@ class CardBuilder:
                     "notification": data.get("notification"),
                 },
             }
+        ]
+
+    def order_cards(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "order",
+                "id": item.get("orderId") or item.get("orderNo") or "order",
+                "title": item.get("movieName") or "订单详情",
+                "subtitle": self._order_subtitle(item),
+                "meta": self._order_meta(item),
+                "payload": item,
+                "actions": [],
+            }
+            for item in orders
+            if isinstance(item, dict)
         ]
 
     def _order_meta(self, data: dict[str, Any]) -> dict[str, Any]:

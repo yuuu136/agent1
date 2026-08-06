@@ -70,6 +70,8 @@ def planner_node(data: AgentGraphState) -> dict[str, Any]:
         "search_movies",
         "search_showtimes",
         "get_seats",
+        "recommend_snacks",
+        "confirm_selection",
         "lock_seats",
         "create_order",
         "pay_order",

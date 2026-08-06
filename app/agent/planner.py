@@ -73,7 +73,15 @@ class TaskPlanner:
                 reason="用户请求查看影片列表",
                 params=self._pick(
                     slots,
-                    ["genre", "city", "cinemaId", "cinemaName", "date", "hallType"],
+                    [
+                        "movieName",
+                        "genre",
+                        "city",
+                        "cinemaId",
+                        "cinemaName",
+                        "date",
+                        "hallType",
+                    ],
                 ),
                 state="selecting_movie",
             )
@@ -84,14 +92,6 @@ class TaskPlanner:
                 reason="用户已选择零食",
                 params=self._pick(slots, ["snackIds"]),
                 state="selecting_snacks",
-            )
-
-        if nlu.intent == "select_coupon":
-            return AgentPlan(
-                action="confirm_selection",
-                reason="用户已选择优惠券",
-                params=self._pick(slots, ["couponId"]),
-                state="selecting_coupon",
             )
 
         if nlu.intent == "nearby_cinema":
@@ -143,16 +143,38 @@ class TaskPlanner:
             return AgentPlan(
                 action="recommend_snacks",
                 reason="用户有零食需求，调用零食 MCP",
-                params=self._pick(slots, ["ticketCount", "snackIds"]),
+                params=self._pick(
+                    slots,
+                    ["orderId", "ticketCount", "cinemaId", "cinemaName", "snackIds"],
+                ),
                 state="selecting_snacks",
             )
 
-        if nlu.intent == "coupon":
+        if nlu.intent == "order_query":
+            list_requested = any(
+                phrase in nlu.reference_text
+                for phrase in ["我的订单", "订单记录", "历史订单"]
+            )
+            if slots.get("orderId") and not list_requested:
+                return AgentPlan(
+                    action="get_order",
+                    reason="用户查看当前订单详情",
+                    params=self._pick(slots, ["orderId"]),
+                    state="answering",
+                )
             return AgentPlan(
-                action="recommend_coupons",
-                reason="用户有优惠需求，调用优惠券 MCP",
-                params=self._pick(slots, ["orderId", "ticketCount", "couponId"]),
-                state="selecting_coupon",
+                action="list_orders",
+                reason="用户查看订单记录",
+                params={},
+                state="answering",
+            )
+
+        if nlu.intent == "location_query":
+            return AgentPlan(
+                action="get_current_location",
+                reason="用户询问当前地理位置，优先读取浏览器经纬度并反向解析地址",
+                params=self._pick(slots, ["location"]),
+                state="answering",
             )
 
         if nlu.intent == "pay_order":
@@ -167,7 +189,7 @@ class TaskPlanner:
                 return AgentPlan(
                     action="create_order",
                     reason="支付前需要先有订单",
-                    params=self._pick(slots, ["showtimeId", "seatIds", "snackIds", "couponId"]),
+                    params=self._pick(slots, ["showtimeId", "seatIds", "snackIds"]),
                     state="creating_order",
                 )
             return AgentPlan(

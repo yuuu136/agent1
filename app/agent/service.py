@@ -391,7 +391,7 @@ class AgentService:
 
         return AgentResponse(
             message=message,
-            state=plan.state,
+            state=state.state or plan.state,
             cards=cards,
             suggestions=suggestions,
             session={
@@ -429,6 +429,7 @@ class AgentService:
             state.pending_action = None
             result.data = {"skipped": "snacks"}
             result.message = "好的，已跳过零食。"
+            self._resume_payment_after_optional_step(state, result)
             return
 
         if plan.action == "confirm_selection" and plan.params.get("skipCoupon"):
@@ -437,6 +438,29 @@ class AgentService:
             state.pending_action = None
             result.data = {"skipped": "coupon"}
             result.message = "好的，已跳过优惠券。"
+            self._resume_payment_after_optional_step(state, result)
+            return
+
+        if plan.action == "confirm_selection" and plan.params.get("snackIds"):
+            snack_ids = plan.params.get("snackIds") or []
+            state.slots["snackIds"] = snack_ids
+            state.selected.pop("snack_candidates", None)
+            result.data = {"snackIds": snack_ids}
+            applied = self._apply_snacks_to_order(
+                state,
+                result,
+                snack_ids,
+                jwt=plan.params.get("jwt"),
+            )
+            if not result.success:
+                return
+            result.message = "零食已加入订单，可以继续支付。"
+            if applied and result.data.get("totalAmount") not in [None, ""]:
+                result.message = (
+                    f"零食已加入订单，合计{result.data['totalAmount']}元，"
+                    "可以继续支付。"
+                )
+            self._resume_payment_after_optional_step(state, result)
             return
 
         if plan.action == "search_movies":
@@ -467,9 +491,6 @@ class AgentService:
             state.slots.pop("changeCinema", None)
         if "snacks" in data:
             state.selected["snack_candidates"] = data["snacks"]
-        if "coupons" in data:
-            state.selected["coupon_candidates"] = data["coupons"]
-
         if plan.action == "search_showtimes":
             state.slots.pop("changeShowtime", None)
 
@@ -478,7 +499,6 @@ class AgentService:
             "seatIds",
             "orderId",
             "lockId",
-            "couponId",
             "snackIds",
             "movieId",
             "movieName",
@@ -513,31 +533,16 @@ class AgentService:
             if result.data.get("paymentReady"):
                 return
 
-        if plan.action == "lock_seats" and result.success:
-            if data.get("orderCreated") and data.get("orderId"):
-                # Spring Boot creates the order as part of /orders/lock.
-                state.selected["order"] = data.copy()
-                state.slots["orderId"] = data.get("orderId")
-                result.data["order"] = data.copy()
-            else:
-                # Keep the local adapter's two-step contract for legacy /api/v1 use.
-                order_plan = AgentPlan(
-                    action="create_order",
-                    params={
-                        **state.slots,
-                        "lockId": data.get("lockId"),
-                        "showtimeId": data.get("showtimeId"),
-                        "seatIds": data.get("seatIds", []),
-                    },
-                    state="creating_order",
-                )
-                order_result = agent_toolbox.execute(order_plan, state)
-                if order_result.success:
-                    state.selected["order"] = order_result.data
-                    state.slots["orderId"] = order_result.data.get("orderId")
-                    result.data["order"] = order_result.data
-                    result.data["orderId"] = order_result.data.get("orderId")
-                    result.message = f"{result.message} {order_result.message}".strip()
+        if plan.action == "lock_seats" and result.success and data.get("orderId"):
+            state.selected["order"] = data.copy()
+            state.slots["orderId"] = data.get("orderId")
+            result.data["order"] = data.copy()
+            self._offer_snacks_after_lock(
+                state,
+                result,
+                data,
+                jwt=plan.params.get("jwt"),
+            )
 
         pay_status = str(data.get("status", "")).upper()
         if plan.action == "pay_order" and result.success and pay_status in {
@@ -562,9 +567,6 @@ class AgentService:
             result.data["ticketStatus"] = ticket_data.get(
                 "ticketStatus",
                 "issued",
-            )
-            result.data.update(
-                self._after_issue_ticket(state, ticket_data)
             )
 
     def _auto_lock_explicit_seats(
@@ -739,12 +741,19 @@ class AgentService:
         state.slots["orderId"] = lock_result.data.get("orderId")
         result.data.clear()
         result.data.update(lock_result.data)
-        result.data["paymentReady"] = True
         result.data["seatPositions"] = positions
         result.message = (
             f"已按你的要求选择{'、'.join(self._seat_position_labels(positions))}，"
             "座位已锁定，订单已创建，可以直接支付。"
         )
+        offered = self._offer_snacks_after_lock(
+            state,
+            result,
+            lock_result.data,
+            jwt=jwt,
+        )
+        if not offered:
+            result.data["paymentReady"] = True
 
     def _remember_showtime_context(
         self,
@@ -785,34 +794,129 @@ class AgentService:
                 )
         return labels
 
-    def _after_issue_ticket(
+    def _offer_snacks_after_lock(
         self,
         state: AgentState,
-        ticket_data: dict[str, Any],
-    ) -> dict[str, Any]:
-        calendar_plan = AgentPlan(
-            action="create_calendar_event",
-            params={"ticket": ticket_data, "slots": state.slots},
-            state="calendar_created",
+        result: ToolResult,
+        order_data: dict[str, Any],
+        jwt: str | None = None,
+    ) -> bool:
+        if state.slots.get("snackIds") or result.data.get("snacks"):
+            return False
+
+        snack_result = agent_toolbox.execute(
+            AgentPlan(
+                action="recommend_snacks",
+                params={
+                    "orderId": order_data.get("orderId") or state.slots.get("orderId"),
+                    "ticketCount": state.slots.get("ticketCount"),
+                    "cinemaId": order_data.get("cinemaId") or state.slots.get("cinemaId"),
+                    "cinemaName": order_data.get("cinemaName") or state.slots.get("cinemaName"),
+                    "jwt": jwt,
+                },
+                state="selecting_snacks",
+            ),
+            state,
         )
-        message_plan = AgentPlan(
-            action="send_ticket_message",
-            params={
-                "ticket": ticket_data,
-                "userId": state.user_id,
-                "phone": state.slots.get("phone") or state.slots.get("phoneNumber"),
-                "slots": state.slots,
-            },
-            state="ticket_notified",
+        snacks = snack_result.data.get("snacks") if snack_result.success else None
+        if not snacks:
+            return False
+
+        state.selected["snack_candidates"] = snacks
+        state.state = "selecting_snacks"
+        state.pending_action = "recommend_snacks"
+        result.data["snacks"] = snacks
+        result.data["showSnackRecommendations"] = True
+        result.data["order"] = order_data.copy()
+        result.data.pop("paymentReady", None)
+        result.message = (
+            "座位已锁定，订单已创建。这里有几款可选零食套餐，"
+            "可以加入套餐，也可以说“不要零食”直接去支付。"
         )
-        calendar_result = agent_toolbox.execute(calendar_plan, state)
-        notification_result = agent_toolbox.execute(message_plan, state)
-        state.selected["calendar"] = calendar_result.data
-        state.selected["notification"] = notification_result.data
-        return {
-            "calendar": calendar_result.data,
-            "notification": notification_result.data,
+        result.suggestions = ["不要零食", "直接支付"]
+        return True
+
+    def _resume_payment_after_optional_step(
+        self,
+        state: AgentState,
+        result: ToolResult,
+    ) -> bool:
+        order = state.selected.get("order")
+        if not isinstance(order, dict):
+            order_id = state.slots.get("orderId")
+            if not order_id:
+                return False
+            order = {"orderId": order_id}
+
+        merged_data = {
+            **order,
+            **result.data,
+            "order": order,
+            "paymentReady": True,
         }
+        result.data = merged_data
+        state.state = "paying"
+        state.pending_action = "pay_order"
+        if result.message:
+            result.message = f"{result.message} 现在可以支付。"
+        else:
+            result.message = "现在可以支付。"
+        result.suggestions = ["确认支付", "查看订单", "取消支付"]
+        return True
+
+    def _apply_snacks_to_order(
+        self,
+        state: AgentState,
+        result: ToolResult,
+        snack_ids: list[Any],
+        jwt: str | None = None,
+    ) -> bool:
+        order_id = state.slots.get("orderId")
+        if not order_id or not jwt:
+            return False
+
+        snack_result = agent_toolbox.execute(
+            AgentPlan(
+                action="replace_order_snacks",
+                params={
+                    "orderId": order_id,
+                    "snackIds": snack_ids,
+                    "jwt": jwt,
+                },
+                state="selecting_snacks",
+            ),
+            state,
+        )
+        if not snack_result.success:
+            result.success = False
+            result.data = snack_result.data
+            result.message = snack_result.message or "零食加入订单失败，请重新选择。"
+            return False
+
+        result.data.update(snack_result.data)
+        order = state.selected.get("order")
+        if isinstance(order, dict):
+            order.update(
+                {
+                    key: value
+                    for key, value in snack_result.data.items()
+                    if value not in [None, ""]
+                }
+            )
+            state.selected["order"] = order
+        else:
+            state.selected["order"] = snack_result.data.copy()
+
+        for key in [
+            "ticketAmount",
+            "snackAmount",
+            "totalAmount",
+            "amount",
+            "selectedSnacks",
+        ]:
+            if key in snack_result.data:
+                state.slots[key] = snack_result.data[key]
+        return True
 
     def _event_text(self, request: ChatRequest) -> str:
         if request.event:
@@ -849,8 +953,6 @@ class AgentService:
             return "当前没有可支付订单，请先选择场次和座位。"
         if plan.action == "confirm_selection" and "零食" in plan.reason:
             return "零食已加入选择，可以继续选座或确认订单。"
-        if plan.action == "confirm_selection" and "优惠券" in plan.reason:
-            return "优惠券已加入选择，可以继续选座或确认订单。"
         if plan.action == "pay_order":
             if result.data.get("ticketStatus") == "issued" or str(result.data.get("status", "")).upper() == "TICKETED":
                 return "支付成功，电子票已出票。"
@@ -873,8 +975,7 @@ class AgentService:
             "ask_ticket_count": ["1张", "2张", "3张"],
             "search_showtimes": ["换便宜点", "晚一点", "附近影院"],
             "get_seats": ["选中间", "选后排", "换一场"],
-            "recommend_snacks": ["双人套餐", "不要零食", "看看优惠券"],
-            "recommend_coupons": ["使用最优惠", "不用券", "继续下单"],
+            "recommend_snacks": ["双人套餐", "不要零食", "直接支付"],
             "lock_seats": ["确认订单", "重新选座", "加零食"],
             "create_order": ["确认支付", "查看订单", "取消"],
         }

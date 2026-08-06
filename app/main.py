@@ -12,7 +12,6 @@ from app.agent import agent_service
 from app.api.agent import router as agent_router
 from app.api.prompts import router as prompts_router
 from app.api.rag import router as rag_router
-from app.api.ticketing import admin_router, router as ticketing_router
 from app.schemas.agent import ChatRequest
 from app.utils.config_handler import agent_config, rag_config
 
@@ -32,8 +31,6 @@ app.add_middleware(
 app.include_router(rag_router)
 app.include_router(prompts_router)
 app.include_router(agent_router)
-app.include_router(ticketing_router)
-app.include_router(admin_router)
 
 
 @app.get("/agent/health")
