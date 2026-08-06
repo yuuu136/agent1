@@ -295,7 +295,11 @@ class RuleBasedNLU:
             and slots.get("movieName")
             and self._looks_like_movie_title(text)
         ):
-            intent = "book_ticket"
+            intent = (
+                "book_ticket"
+                if self._has_explicit_booking_cue(text)
+                else "search_movies"
+            )
 
         return NLUResult(
             intent=intent,
@@ -970,6 +974,39 @@ class RuleBasedNLU:
 
     def _is_movie_keyword_query(self, text: str) -> bool:
         return self._extract_movie_search_keyword(text) is not None
+
+    def _has_explicit_booking_cue(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        if any(
+            marker in normalized
+            for marker in [
+                "买",
+                "订",
+                "购票",
+                "购买",
+                "预订",
+                "影票",
+                "电影票",
+                "张",
+                "票",
+                "座",
+                "今晚",
+                "明晚",
+                "今天",
+                "明天",
+                "上午",
+                "下午",
+                "晚上",
+                "几点",
+            ]
+        ):
+            return True
+        return bool(
+            re.search(
+                r"(?:\d+|[一二两三四五六七八九十俩]{1,3})(?:点|:|张|人|位|票)",
+                normalized,
+            )
+        )
 
     def _extract_movie_search_keyword(self, text: str) -> str | None:
         normalized = _normalize_short_text(text)

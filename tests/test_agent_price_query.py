@@ -49,10 +49,10 @@ def test_price_range_phrase_is_not_extracted_as_movie_name() -> None:
     assert "movieName" not in result.slots
 
 
-def test_standalone_movie_title_enters_booking_flow() -> None:
+def test_standalone_movie_title_searches_movie_cards_first() -> None:
     result = nlu_engine.extract(
         ChatRequest(sessionId="movie-title-test", text="奥德赛")
     )
 
-    assert result.intent == "book_ticket"
+    assert result.intent == "search_movies"
     assert result.slots["movieName"] == "奥德赛"
