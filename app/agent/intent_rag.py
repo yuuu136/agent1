@@ -3,6 +3,7 @@ import math
 import re
 from dataclasses import dataclass
 
+from app.agent.intent_catalog import intent_catalog
 from app.rag.documents import KnowledgeChunk
 from app.rag.vector_store import ChromaVectorStore
 from app.utils.config_handler import chroma_config, rag_config
@@ -22,47 +23,6 @@ class IntentMatch:
     runner_up_score: float
 
 
-INTENT_EXAMPLES = [
-    IntentExample("我想看电影", "search_movies"),
-    IntentExample("想找点片子看", "search_movies"),
-    IntentExample("有什么电影", "search_movies"),
-    IntentExample("最近有什么上映", "search_movies"),
-    IntentExample("帮我推荐几部电影", "search_movies"),
-    IntentExample("今天有什么片子", "search_movies"),
-    IntentExample("想看部电影", "search_movies"),
-    IntentExample("想看部片子", "search_movies"),
-    IntentExample("想看点片子", "search_movies"),
-    IntentExample("想看一部片", "search_movies"),
-    IntentExample("有没有电影看", "search_movies"),
-    IntentExample("给我买两张今晚八点的电影票", "book_ticket"),
-    IntentExample("帮我订一张功夫女足影票", "book_ticket"),
-    IntentExample("买两张蜘蛛侠电影票", "book_ticket"),
-    IntentExample("今晚去看科幻片", "book_ticket"),
-    IntentExample("明晚八点订票", "book_ticket"),
-    IntentExample("附近有什么影院", "nearby_cinema"),
-    IntentExample("离我近的电影院", "nearby_cinema"),
-    IntentExample("周边有哪些影院", "nearby_cinema"),
-    IntentExample("找附近影城", "nearby_cinema"),
-    IntentExample("我现在在哪里", "location_query"),
-    IntentExample("我的当前位置", "location_query"),
-    IntentExample("当前经纬度是多少", "location_query"),
-    IntentExample("票价多少", "price_query"),
-    IntentExample("这一场多少钱", "price_query"),
-    IntentExample("有便宜一点的吗", "select_or_modify"),
-    IntentExample("换个便宜的", "select_or_modify"),
-    IntentExample("晚一点的场次", "select_or_modify"),
-    IntentExample("来点爆米花", "snack"),
-    IntentExample("我要加一瓶可乐", "snack"),
-    IntentExample("有没有零食", "snack"),
-    IntentExample("我的订单", "order_query"),
-    IntentExample("查一下订单", "order_query"),
-    IntentExample("支付结果怎么样", "order_query"),
-    IntentExample("退票规则是什么", "faq"),
-    IntentExample("退款多久能到", "faq"),
-    IntentExample("改签规则", "faq"),
-]
-
-
 class IntentRAGRetriever:
     def __init__(
         self,
@@ -70,8 +30,21 @@ class IntentRAGRetriever:
         score_threshold: float | None = None,
         margin_threshold: float | None = None,
     ) -> None:
-        self.examples = examples or INTENT_EXAMPLES
         settings = rag_config.get("intent_rag", {})
+        document_path = settings.get(
+            "document_path",
+            "data/intent/intent_catalog.md",
+        )
+        document_examples = [
+            IntentExample(text=item.text, intent=item.intent)
+            for item in intent_catalog.intent_examples()
+        ]
+        self.examples = examples or document_examples
+        if not self.examples:
+            raise ValueError("Intent catalog has no intent examples")
+        self.enabled = bool(settings.get("enabled", True))
+        self.document_path = document_path
+        self.corpus_hash = self._corpus_hash(self.examples)
         self.score_threshold = (
             score_threshold
             if score_threshold is not None
@@ -91,7 +64,7 @@ class IntentRAGRetriever:
             ),
             collection_name=settings.get(
                 "collection_name",
-                "movie_ticket_agent_intents_v2",
+                "movie_ticket_agent_intents_v3",
             ),
             distance_metric=chroma_config.get("chroma", {}).get(
                 "distance_metric",
@@ -101,6 +74,9 @@ class IntentRAGRetriever:
         self._ensure_index()
 
     def retrieve(self, text: str) -> IntentMatch | None:
+        if not self.enabled:
+            return None
+
         query_vector = self._embed(text)
         if not query_vector:
             return None
@@ -143,7 +119,11 @@ class IntentRAGRetriever:
         )
 
     def _ensure_index(self) -> None:
-        if self.store.count() > 0:
+        current_metadata = getattr(self.store.collection, "metadata", {}) or {}
+        if (
+            self.store.count() > 0
+            and current_metadata.get("intent_corpus_hash") == self.corpus_hash
+        ):
             return
         chunks = [
             KnowledgeChunk(
@@ -151,6 +131,7 @@ class IntentRAGRetriever:
                 content=example.text,
                 metadata={
                     "source": "intent_examples",
+                    "document_path": self.document_path,
                     "intent": example.intent,
                     "example": example.text,
                     "index": index,
@@ -163,9 +144,18 @@ class IntentRAGRetriever:
             embeddings=[self._embed(example.text) for example in self.examples],
             metadata={
                 "source_type": "intent_examples",
+                "document_path": self.document_path,
+                "intent_corpus_hash": self.corpus_hash,
+                "example_count": len(self.examples),
                 "embedding_dimension": self.embedding_dimension,
             },
         )
+
+    def _corpus_hash(self, examples: list[IntentExample]) -> str:
+        payload = "\n".join(
+            f"{example.intent}:{example.text}" for example in examples
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
     def _embed(self, text: str) -> list[float]:
         normalized = re.sub(r"[\s，。,.!?！？、:：;；]+", "", text.strip()).casefold()

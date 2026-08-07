@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.agent.intent_catalog import intent_catalog
 from app.agent.intent_rag import intent_rag_retriever
 from app.schemas.agent import ChatRequest, NLUResult
 
@@ -28,294 +29,34 @@ CHINESE_HOURS = {
     "十二": 12,
 }
 
-ACK_TEXTS = {
-    "好",
-    "好的",
-    "好吧",
-    "就好",
-    "就行",
-    "可以的",
-    "行",
-    "行吧",
-    "可以",
-    "嗯",
-    "哦",
-    "知道了",
-    "谢谢",
-    "谢谢你",
-    "感谢",
-    "多谢",
-    "辛苦了",
-    "没问题",
-    "没事",
-    "不用谢",
-    "收到",
-    "明白了",
-    "我知道了",
-    "很好",
-}
-GREETING_TEXTS = {
-    "你好",
-    "您好",
-    "嗨",
-    "哈喽",
-    "hi",
-    "hello",
-    "早上好",
-    "早安",
-    "上午好",
-    "中午好",
-    "下午好",
-    "晚上好",
-    "晚安",
-    "再见",
-    "拜拜",
-    "拜拜了",
-    "开始",
-    "start",
-}
-CANCEL_TEXTS = {
-    "取消",
-    "取消订单",
-    "不用了",
-    "算了",
-    "先不买",
-    "不买了",
-    "别买了",
-    "不要了",
-    "先不要了",
-    "暂时不要了",
-}
-SHOWTIME_QUERY_TEXTS = {
-    "有什么场次",
-    "有哪些场次",
-    "有些什么场次",
-    "场次有哪些",
-    "查场次",
-    "查看场次",
-    "看看场次",
-    "查一下场次",
-    "有什么时间",
-    "有哪些时间",
-}
-NON_MOVIE_TEXTS = GREETING_TEXTS | ACK_TEXTS | SHOWTIME_QUERY_TEXTS | {
-    "选择影院",
-    "选影院",
-    "选择电影",
-    "选电影",
-    "选择这场",
-    "这个",
-    "这场",
-    "这家",
-    "就这个",
-    "就这场",
-    "就这家",
-    "确认",
-    "确认一下",
-    "确认订单",
-    "确认座位",
-    "确认支付",
-    "取消",
-    "取消订单",
-    "不用了",
-    "算了",
-    "先不买",
-    "不买了",
-    "别买了",
-    "都可以",
-    "都行",
-    "随便",
-    "不限",
-    "时间不限",
-    "什么时候都可以",
-    "哪个时间都可以",
-    "无所谓",
-    "换一场",
-    "换个场次",
-    "换到下一场",
-    "下一场",
-    "再来一场",
-    "下一个",
-    "换时间",
-    "换个时间",
-    "早一点",
-    "晚一点",
-    "便宜点",
-    "换便宜点",
-    "不要这个",
-    "不要这场",
-    "重新选座",
-    "重新选择座位",
-    "换个位置",
-    "换座位",
-    "更换座位",
-    "退了",
-    "退了吧",
-    "退掉",
-    "退掉吧",
-    "帮我退了",
-    "这张票退了",
-    "这个票退了",
-}
-MOVIE_SEARCH_TEXTS = {
-    "我想看电影",
-    "想看电影",
-    "我要看电影",
-    "看电影",
-    "去看电影",
-    "帮我看电影",
-    "最近热映",
-    "正在上映",
-    "有什么电影",
-    "有啥电影",
-    "有哪些电影",
-    "有些什么电影",
-    "有什么影片",
-    "有啥影片",
-    "有哪些影片",
-    "有些什么影片",
-    "推荐电影",
-    "推荐影片",
-    "帮我推荐电影",
-    "帮我推荐影片",
-    "看看电影",
-    "查电影",
-    "有电影看吗",
-    "有什么电影看",
-    "有啥电影看",
-}
-PRICE_QUERY_MARKERS = (
-    "多少钱",
-    "多少元",
-    "票价",
-    "价格",
-    "价位",
-    "什么价格",
-    "什么价",
-    "单价",
-    "费用",
-    "贵不贵",
-)
-ORDER_QUERY_PHRASES = (
-    "查看订单",
-    "查订单",
-    "查询订单",
-    "看看订单",
-    "我的订单",
-    "订单详情",
-    "订单记录",
-    "历史订单",
-    "付款了吗",
-    "支付了吗",
-    "付钱了吗",
-    "支付状态",
-    "付款状态",
-    "支付结果",
-    "付款结果",
-)
-LOCATION_QUERY_PHRASES = (
-    "我的地理位置",
-    "我现在的具体位置",
-    "我的具体位置",
-    "我现在的位置",
-    "我的当前位置",
-    "当前位置",
-    "当前定位",
-    "定位信息",
-    "我的位置",
-    "现在在哪里",
-    "现在在哪",
-    "现在在哪儿",
-    "当前位置在哪里",
-    "当前位置在哪",
-    "当前位置在哪儿",
-    "这里是哪里",
-    "这里在哪",
-    "这里在哪儿",
-    "这是哪里",
-    "这是哪儿",
-    "我在哪里",
-    "我在哪",
-    "我在哪儿",
-    "我的坐标",
-    "当前坐标",
-    "经纬度",
-)
-PRICE_PREFERENCE_MARKERS = (
-    "便宜",
-    "低价",
-    "价格低",
-    "价低",
-    "实惠",
-    "省钱",
-    "最低价",
-    "最省",
-)
-TIME_PREFERENCE_TEXTS = (
-    "早一点",
-    "早些",
-    "早点",
-    "早一些",
-    "早一点儿",
-    "更早",
-    "晚一点",
-    "晚些",
-    "晚点",
-    "晚一些",
-    "晚一点儿",
-    "更晚",
-)
-GENERIC_BOOKING_TEXTS = {
-    "book movie tickets",
-    "buy movie tickets",
-    "buy tickets",
-    "book tickets",
-    "movie tickets",
-    "tickets",
-}
 IMPLICIT_SINGLE_TICKET_PATTERN = re.compile(
     r"(?:购买|预订|买|订|来)\s*张"
 )
-SNACK_ALIASES = {
-    "可乐": ("可乐", "可口可乐", "cola", "coke"),
-    "爆米花": ("爆米花",),
-    "雪碧": ("雪碧",),
-    "饮料": ("饮料", "汽水"),
-    "套餐": ("套餐",),
-    "小吃": ("小吃", "零食"),
-}
-MOVIE_RECOMMENDATION_MARKERS = {
-    "couple": ("情侣", "约会", "恋人", "对象", "浪漫"),
-    "family": ("亲子", "带孩子", "一家人", "合家欢"),
-    "high_rating": ("高分", "高评分", "评分高", "评分最高", "口碑"),
-    "box_office": ("票房", "最卖座"),
-    "hot": ("热映", "热门", "最火"),
-}
 
 
 def _normalize_short_text(text: str) -> str:
     return re.sub(r"[\s，。,.!?！？、:：;；]+", "", text.strip()).casefold()
 
 
+def _contains_catalog_term(text: str, lexicon: str) -> bool:
+    normalized = text.casefold()
+    return any(term.casefold() in normalized for term in intent_catalog.terms(lexicon))
+
+
 def is_greeting_text(text: str) -> bool:
     normalized = _normalize_short_text(text)
-    greeting_values = {_normalize_short_text(value) for value in GREETING_TEXTS}
-    if normalized in greeting_values:
-        return True
     return normalized in {
-        "你好呀",
-        "您好呀",
-        "你好啊",
-        "您好啊",
-        "嗨呀",
-        "哈喽呀",
+        _normalize_short_text(value)
+        for value in intent_catalog.terms("greeting")
     }
 
 
 def is_ack_text(text: str) -> bool:
     normalized = _normalize_short_text(text)
-    ack_values = {_normalize_short_text(value) for value in ACK_TEXTS}
-    return normalized in ack_values
+    return normalized in {
+        _normalize_short_text(value)
+        for value in intent_catalog.terms("ack")
+    }
 
 
 class RuleBasedNLU:
@@ -385,11 +126,11 @@ class RuleBasedNLU:
             return "refund_status_query"
         if self._is_refund_request_text(text):
             return "refund_order"
-        if any(word in text for word in ["退票", "改签", "规则", "政策", "怎么处理", "FAQ"]):
+        if _contains_catalog_term(text, "faq"):
             return "faq"
         if self._is_price_preference_text(text):
             return "select_or_modify"
-        if any(marker in text for marker in PRICE_QUERY_MARKERS):
+        if _contains_catalog_term(text, "price_query"):
             return "price_query"
         if self._is_movie_recommendation_text(text):
             return "search_movies"
@@ -397,9 +138,13 @@ class RuleBasedNLU:
             return "search_movies"
         if self._is_movie_search_text(text):
             return "search_movies"
-        if any(word in text for word in ["附近", "最近", "周边", "离我近", "高德", "地图"]):
+        if self._is_showtime_query_text(text):
+            return "book_ticket"
+        if self._is_explicit_showtime_booking_text(text):
+            return "book_ticket"
+        if _contains_catalog_term(text, "nearby_cinema"):
             return "nearby_cinema"
-        if any(word in lowered for word in ["nearby", "around me", "map", "amap"]):
+        if _contains_catalog_term(lowered, "nearby_cinema_english"):
             return "nearby_cinema"
         if self._is_location_query_text(text):
             return "location_query"
@@ -420,8 +165,12 @@ class RuleBasedNLU:
             ]
         ):
             return "book_ticket"
-        if any(word in text for word in ["优惠", "优惠券", "券", "折扣", "便宜"]):
+        if _contains_catalog_term(text, "coupon"):
             return "coupon" if "券" in text or "优惠" in text else "select_or_modify"
+        if _contains_catalog_term(text, "seat"):
+            if _contains_catalog_term(text, "booking_with_seat"):
+                return "book_ticket"
+            return "seat_query"
         intent_match = (
             intent_rag_retriever.retrieve(text)
             if self._should_use_intent_rag(text)
@@ -433,29 +182,13 @@ class RuleBasedNLU:
             return "book_ticket"
         if self._extract_snack_requests(text):
             return "snack"
-        if any(
-            word in text
-            for word in [
-                "座位",
-                "选座",
-                "靠中",
-                "中间",
-                "前排",
-                "后排",
-                "位置",
-                "坐席",
-            ]
-        ):
-            if any(word in text for word in ["买", "订", "购票", "影票", "电影票", "看电影"]):
-                return "book_ticket"
-            return "seat_query"
-        if any(word in text for word in ["支付", "付款", "出票"]):
+        if _contains_catalog_term(text, "payment"):
             return "pay_order"
-        if any(word in text for word in ["订单", "确认", "就这个", "就这场", "可以"]):
+        if _contains_catalog_term(text, "confirm"):
             return "confirm_order"
-        if any(word in text for word in ["买票", "订票", "购票", "影票", "电影票", "电影", "场次", "影院", "看", "买"]):
+        if _contains_catalog_term(text, "booking"):
             return "book_ticket"
-        if any(word in lowered for word in ["book", "ticket", "movie", "showtime", "cinema"]):
+        if _contains_catalog_term(lowered, "booking_english"):
             return "book_ticket"
         if "rag" in lowered:
             return "faq"
@@ -603,7 +336,10 @@ class RuleBasedNLU:
         return slots
 
     def _should_extract_movie_name(self, event: str | None, intent: str, text: str) -> bool:
-        if text.strip().casefold() in GENERIC_BOOKING_TEXTS:
+        if text.strip().casefold() in {
+            value.casefold()
+            for value in intent_catalog.terms("generic_booking")
+        }:
             return False
         if self._is_ticket_count_only_request(text):
             return False
@@ -623,16 +359,7 @@ class RuleBasedNLU:
             return False
         if any(
             marker in normalized
-            for marker in (
-                "附近",
-                "影院",
-                "座位",
-                "多少钱",
-                "价位",
-                "价格",
-                "优惠",
-                "规则",
-            )
+            for marker in intent_catalog.terms("movie_title_exclusion")
         ):
             return False
         return bool(
@@ -710,7 +437,7 @@ class RuleBasedNLU:
     def _extract_snack_requests(self, text: str) -> list[dict[str, Any]]:
         requests: list[dict[str, Any]] = []
         normalized = text.casefold()
-        for canonical, aliases in SNACK_ALIASES.items():
+        for canonical, aliases in intent_catalog.mapping("snack_alias").items():
             matched_alias = next(
                 (alias for alias in aliases if alias.casefold() in normalized),
                 None,
@@ -775,20 +502,20 @@ class RuleBasedNLU:
                     return None
                 minute = "30" if chinese_match.group(2) else "00"
                 return f"{hour:02d}:{minute}"
-        if "今晚" in text or "明晚" in text or "晚上" in text:
+        if _contains_catalog_term(text, "time_evening"):
             return "evening"
-        if "下午" in text:
+        if _contains_catalog_term(text, "time_afternoon"):
             return "afternoon"
-        if "上午" in text:
+        if _contains_catalog_term(text, "time_morning"):
             return "morning"
         return None
 
     def _extract_date(self, text: str) -> str | None:
-        if "今天" in text or "今晚" in text:
+        if _contains_catalog_term(text, "date_today"):
             return "today"
-        if "明天" in text or "明晚" in text:
+        if _contains_catalog_term(text, "date_tomorrow"):
             return "tomorrow"
-        if "周末" in text:
+        if _contains_catalog_term(text, "date_weekend"):
             return "weekend"
 
         match = re.search(
@@ -813,21 +540,16 @@ class RuleBasedNLU:
         return None
 
     def _extract_genre(self, text: str) -> str | None:
-        for genre in ["喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"]:
-            if genre in text:
+        for genre, aliases in intent_catalog.mapping("genre").items():
+            if any(alias in text for alias in aliases):
                 return genre
         return None
 
     def _extract_hall_type(self, text: str) -> str | None:
         upper_text = text.upper()
-        if "IMAX" in upper_text:
-            return "IMAX"
-        if "杜比" in text:
-            return "杜比"
-        if "巨幕" in text:
-            return "巨幕"
-        if "激光" in text:
-            return "激光"
+        for hall_type, aliases in intent_catalog.mapping("hall_type").items():
+            if any(alias.upper() in upper_text for alias in aliases):
+                return hall_type
         return None
 
     def _extract_movie_name(self, text: str) -> str | None:
@@ -890,10 +612,8 @@ class RuleBasedNLU:
         value = value.strip("《》「」『』“”\"' ")
         value = value.strip(" ，。,.!?！？的")
         if (
-            value in {"喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}
-            or value in {"电影", "影片", "片", "片子"}
-            or "片子" in value
-            or "推荐" in value
+            value in intent_catalog.mapping("genre")
+            or value in intent_catalog.terms("movie_title_generic")
             or self._is_non_movie_text(value)
         ):
             return None
@@ -918,7 +638,13 @@ class RuleBasedNLU:
 
         known_phrases = {
             re.sub(r"[\s，。,.!?！？、:：;；]+", "", phrase).casefold()
-            for phrase in NON_MOVIE_TEXTS
+            for phrase in (
+                *intent_catalog.terms("greeting"),
+                *intent_catalog.terms("ack"),
+                *intent_catalog.terms("cancel"),
+                *intent_catalog.terms("showtime_query"),
+                *intent_catalog.terms("non_movie"),
+            )
         }
         if normalized in known_phrases:
             return True
@@ -948,14 +674,9 @@ class RuleBasedNLU:
         return int(value) if value.isdigit() else CHINESE_NUMBERS.get(value)
 
     def _extract_seat_preference(self, text: str) -> str | None:
-        if any(word in text for word in ["中间", "靠中", "居中"]):
-            return "middle"
-        if "前排" in text:
-            return "front"
-        if "后排" in text:
-            return "back"
-        if "便宜座" in text or "便宜位置" in text:
-            return "cheap"
+        for preference, aliases in intent_catalog.mapping("seat_preference").items():
+            if any(alias in text for alias in aliases):
+                return preference
         return None
 
     def _extract_seat_positions(self, text: str) -> list[dict[str, int]]:
@@ -1029,68 +750,26 @@ class RuleBasedNLU:
         return (
             self._is_price_preference_text(text)
             or self._is_time_preference_text(text)
-            or "不要" in text
+            or _contains_catalog_term(text, "modification")
             or self._is_negative_hall_type_request(text)
             or self._is_plain_hall_type_request(text)
-            or any(
-                word in text
-                for word in [
-                    "换",
-                    "改",
-                    "更",
-                    "不要这个",
-                    "不要这场",
-                    "不想要这场",
-                    "便宜点",
-                    "换便宜点",
-                    "晚一点",
-                    "早一点",
-                ]
-            )
         )
 
     def _is_cancel_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
-        cancel_values = {_normalize_short_text(value) for value in CANCEL_TEXTS}
+        cancel_values = {
+            _normalize_short_text(value)
+            for value in intent_catalog.terms("cancel")
+        }
         if normalized in cancel_values:
             return True
-        return any(
-            phrase in normalized
-            for phrase in [
-                "先不支付",
-                "暂时不支付",
-                "不想支付",
-                "不要支付",
-                "取消支付",
-                "取消付款",
-                "不支付",
-                "先不付",
-                "暂时不付",
-                "不想付",
-                "不想付款",
-                "不付款了",
-                "不付钱了",
-                "先不付款",
-                "暂时不付款",
-                "不付了",
-                "暂时不要了",
-                "先不要了",
-                "不想要了",
-                "不想买了",
-                "不用买了",
-                "不想看了",
-                "不看了",
-                "我不要了",
-                "我不想要了",
-                "算了吧",
-            ]
-        )
+        return _contains_catalog_term(normalized, "cancel_contains")
 
     def _is_order_query_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
         if "退票" in normalized or "退款" in normalized:
             return False
-        if any(phrase in normalized for phrase in ORDER_QUERY_PHRASES):
+        if _contains_catalog_term(normalized, "order_query"):
             return True
         return bool(
             re.search(r"(?:查|查看|查询|看看).{0,3}订单", normalized)
@@ -1098,39 +777,15 @@ class RuleBasedNLU:
 
     def _is_refund_request_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
-        if not any(
-            marker in normalized
-            for marker in [
-                "退票",
-                "退款",
-                "申请退款",
-                "退了",
-                "退掉",
-                "退单",
-                "不要这张票",
-                "这张票不要",
-                "这张票退",
-                "这个票退",
-            ]
-        ):
+        if not _contains_catalog_term(normalized, "refund_request"):
             return False
-        if any(marker in normalized for marker in ["规则", "政策", "说明", "怎么", "如何", "能不能"]):
+        if _contains_catalog_term(normalized, "refund_faq"):
             return False
         return True
 
     def _is_refund_status_query_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
-        return any(
-            marker in normalized
-            for marker in [
-                "退票状态",
-                "退款状态",
-                "退票结果",
-                "退款结果",
-                "退票成功了吗",
-                "退款成功了吗",
-            ]
-        )
+        return _contains_catalog_term(normalized, "refund_status")
 
     def _positive_int(self, value: Any) -> int | None:
         try:
@@ -1142,9 +797,23 @@ class RuleBasedNLU:
     def _is_movie_search_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
         movie_search_values = {
-            _normalize_short_text(value) for value in MOVIE_SEARCH_TEXTS
+            _normalize_short_text(value)
+            for value in intent_catalog.terms("movie_search")
         }
         return any(value in normalized for value in movie_search_values)
+
+    def _is_showtime_query_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        showtime_values = {
+            _normalize_short_text(value)
+            for value in intent_catalog.terms("showtime_query")
+        }
+        return any(value in normalized for value in showtime_values)
+
+    def _is_explicit_showtime_booking_text(self, text: str) -> bool:
+        if "场次" not in text or self._is_modification(text):
+            return False
+        return _contains_catalog_term(text, "explicit_showtime_booking")
 
     def _is_movie_keyword_query(self, text: str) -> bool:
         return self._extract_movie_search_keyword(text) is not None
@@ -1160,12 +829,15 @@ class RuleBasedNLU:
         if not normalized:
             return None
 
-        for criteria, markers in MOVIE_RECOMMENDATION_MARKERS.items():
+        for criteria, markers in intent_catalog.mapping(
+            "recommendation_criteria"
+        ).items():
             if any(marker in normalized for marker in markers):
                 return criteria
 
-        if "推荐" in normalized and any(
-            marker in normalized for marker in ["电影", "影片", "片子", "片"]
+        if "推荐" in normalized and _contains_catalog_term(
+            normalized,
+            "recommendation_general",
         ):
             return "general"
         return None
@@ -1174,84 +846,18 @@ class RuleBasedNLU:
         normalized = _normalize_short_text(text)
         if not normalized:
             return False
-        markers = [
-            "想",
-            "要",
-            "帮",
-            "找",
-            "查",
-            "看",
-            "推荐",
-            "有",
-            "哪些",
-            "什么",
-            "片",
-            "电影",
-            "影片",
-            "影院",
-            "影城",
-            "附近",
-            "周边",
-            "订单",
-            "票价",
-            "多少钱",
-            "零食",
-            "可乐",
-            "爆米花",
-        ]
-        if not any(marker in normalized for marker in markers):
+        if not _contains_catalog_term(normalized, "rag_markers"):
             return False
-        if self._looks_like_movie_title(text) and not any(
-            marker in normalized
-            for marker in [
-                "想",
-                "要",
-                "帮",
-                "找",
-                "查",
-                "看",
-                "推荐",
-                "有",
-                "哪些",
-                "什么",
-                "片",
-                "电影",
-                "影片",
-                "影院",
-                "影城",
-                "附近",
-                "周边",
-            ]
+        if self._looks_like_movie_title(text) and not _contains_catalog_term(
+            normalized,
+            "rag_title_markers",
         ):
             return False
         return True
 
     def _has_explicit_booking_cue(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
-        if any(
-            marker in normalized
-            for marker in [
-                "买",
-                "订",
-                "购票",
-                "购买",
-                "预订",
-                "影票",
-                "电影票",
-                "张",
-                "买票",
-                "订票",
-                "座",
-                "今晚",
-                "明晚",
-                "今天",
-                "明天",
-                "上午",
-                "下午",
-                "晚上",
-                "几点",
-            ]
-        ):
+        if _contains_catalog_term(normalized, "booking_cues"):
             return True
         return bool(
             re.search(
@@ -1264,19 +870,7 @@ class RuleBasedNLU:
         normalized = _normalize_short_text(text)
         if not normalized:
             return None
-        if any(
-            marker in normalized
-            for marker in [
-                "买",
-                "订",
-                "购票",
-                "购买",
-                "预订",
-                "影票",
-                "电影票",
-                "几张",
-            ]
-        ):
+        if _contains_catalog_term(normalized, "movie_keyword_excluded"):
             return None
         match = re.fullmatch(
             r"(?:有没有|有无|查一下|查询|查看|看看|找一下|找)?"
@@ -1287,36 +881,20 @@ class RuleBasedNLU:
         if not match:
             return None
         keyword = match.group("keyword").strip()
-        generic_keywords = {
-            "什么",
-            "啥",
-            "哪些",
-            "一些",
-            "些",
-            "推荐",
-            "热映",
-            "我想看",
-            "想看",
-            "我要看",
-            "帮我推荐",
-            "推荐一下",
-            "看看",
-            "查一下",
-        }
+        generic_keywords = set(intent_catalog.terms("movie_keyword_generic"))
         if keyword in generic_keywords:
             return None
-        if keyword.startswith(("什么", "啥", "哪些", "有什么", "有啥", "有哪些", "有些")):
+        if keyword.startswith(
+            intent_catalog.terms("movie_keyword_prefix_excluded")
+        ):
             return None
         return keyword
 
     def _is_location_query_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
-        if any(
-            phrase in normalized
-            for phrase in ["换个位置", "换位置", "换座位", "选座", "座位"]
-        ):
+        if _contains_catalog_term(normalized, "location_seat_exclusion"):
             return False
-        if any(phrase in normalized for phrase in LOCATION_QUERY_PHRASES):
+        if _contains_catalog_term(normalized, "location_query"):
             return True
         return bool(
             re.search(
@@ -1338,87 +916,26 @@ class RuleBasedNLU:
         )
 
     def _is_negative_snack_request(self, text: str) -> bool:
-        return any(
-            phrase in text
-            for phrase in [
-                "不要零食",
-                "不需要零食",
-                "不用零食",
-                "不吃零食",
-                "不加零食",
-                "不买零食",
-                "不买零食了",
-                "零食不要",
-                "零食不要了",
-                "不要爆米花",
-                "不需要爆米花",
-                "不加爆米花",
-                "不加爆米花了",
-                "不买爆米花",
-                "不要饮料",
-                "不买饮料",
-                "不要套餐",
-                "不加套餐",
-                "不需要小吃",
-            ]
-        )
+        return _contains_catalog_term(text, "snack_negative")
 
     def _is_negative_coupon_request(self, text: str) -> bool:
-        return any(
-            phrase in text
-            for phrase in [
-                "不用券",
-                "不用优惠券",
-                "不使用优惠券",
-                "不要优惠券",
-                "优惠券不要",
-                "优惠券不要了",
-                "不需要优惠券",
-                "不想用券",
-                "不使用券",
-                "不用优惠",
-                "不使用优惠",
-                "不要优惠",
-            ]
-        )
+        return _contains_catalog_term(text, "coupon_negative")
 
     def _is_price_preference_text(self, text: str) -> bool:
-        return any(marker in text for marker in PRICE_PREFERENCE_MARKERS)
+        return _contains_catalog_term(text, "price_preference")
 
     def _is_time_preference_text(self, text: str) -> bool:
-        return any(marker in text for marker in TIME_PREFERENCE_TEXTS)
+        return _contains_catalog_term(text, "time_preference")
 
     def _is_negative_hall_type_request(self, text: str) -> bool:
         if not self._extract_hall_type(text):
             return False
         normalized = re.sub(r"\s+", "", text)
-        return any(
-            marker in normalized
-            for marker in [
-                "不要",
-                "不想要",
-                "不需要",
-                "不用",
-                "别要",
-                "不要看",
-                "不看",
-            ]
-        )
+        return _contains_catalog_term(normalized, "negative_hall")
 
     def _is_plain_hall_type_request(self, text: str) -> bool:
         normalized = re.sub(r"\s+", "", text)
-        return any(
-            phrase in normalized
-            for phrase in [
-                "普通厅",
-                "普通场",
-                "普通版",
-                "普通2D",
-                "2D就行",
-                "换普通",
-                "改普通",
-            ]
-        )
+        return _contains_catalog_term(normalized, "plain_hall")
 
     def _add_clear_slots(self, slots: dict[str, Any], *keys: str) -> None:
         current = slots.get("__clearSlots")
