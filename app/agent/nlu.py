@@ -429,6 +429,8 @@ class RuleBasedNLU:
         )
         if intent_match:
             return intent_match.intent
+        if self._is_movie_browsing(text):
+            return "search_movies"
         if self._has_booking_slot_text(text):
             return "book_ticket"
         if self._extract_snack_requests(text):
@@ -890,7 +892,9 @@ class RuleBasedNLU:
         value = value.strip("《》「」『』“”\"' ")
         value = value.strip(" ，。,.!?！？的")
         if (
-            value in {"喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}
+            value in {"喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖",
+                       "动作片", "喜剧片", "爱情片", "科幻片", "动画片", "悬疑片", "恐怖片",
+                       "战争片", "纪录片", "惊悚片"}
             or value in {"电影", "影片", "片", "片子"}
             or "片子" in value
             or "推荐" in value
@@ -1148,6 +1152,25 @@ class RuleBasedNLU:
 
     def _is_movie_keyword_query(self, text: str) -> bool:
         return self._extract_movie_search_keyword(text) is not None
+
+    def _is_movie_browsing(self, text: str) -> bool:
+        """用户想浏览电影但没有指定具体电影名时返回 True。"""
+        if self._extract_movie_name(text):
+            return False
+        if self._extract_ticket_count(text) or self._extract_date(text) or self._extract_time(text):
+            return False
+        genre = self._extract_genre(text)
+        if genre:
+            return True
+        if "电影" not in text and "片" not in text:
+            return False
+        if any(phrase in text for phrase in [
+            "看电影", "看看电影", "看看有什么电影", "有什么电影可以看",
+            "想看电影", "想看啥电影", "想看什么电影",
+            "想看什么片", "有什么片", "最近有什么片",
+        ]):
+            return True
+        return False
 
     def _is_movie_recommendation_text(self, text: str) -> bool:
         return bool(

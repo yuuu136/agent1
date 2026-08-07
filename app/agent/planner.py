@@ -299,16 +299,15 @@ class TaskPlanner:
             if missing_plan:
                 return missing_plan
 
-            if slots.get("movieId") or slots.get("movieName") or slots.get("genre"):
+            if slots.get("movieId") or slots.get("movieName"):
                 return AgentPlan(
                     action="search_showtimes",
-                    reason="已有电影或类型、时间和票数，查询场次",
+                    reason="已有具体电影，查询场次",
                     params=self._pick(
                         slots,
                         [
                             "movieId",
                             "movieName",
-                            "genre",
                             "date",
                             "timeRange",
                             "ticketCount",

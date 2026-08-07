@@ -52,7 +52,7 @@ def test_chat_booking_text_requires_login_for_real_ticketing() -> None:
 
     payload = response.json()
     assert response.status_code == 200
-    assert payload["state"] == "selecting_showtime"
+    assert payload["state"] == "selecting_movie"
     assert payload["cards"] == []
     assert payload["message"] == "请先登录后再使用真实票务服务。"
 

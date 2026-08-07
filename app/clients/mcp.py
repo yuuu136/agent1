@@ -119,18 +119,19 @@ class SpringBootMovieTicketMCP:
                     recommendation_criteria,
                     cinema_name=cinema_name,
                     has_showtimes=True,
+                    genre=arguments.get("genre"),
+                    keyword=keyword,
                 ),
             )
 
         data = self._get_business(
-            "/api/user/movies",
+            "/api/agent/movies",
             arguments,
             {
                 "page": arguments.get("page", 1),
                 "size": arguments.get("size", 10),
                 "keyword": keyword,
                 "genre": arguments.get("genre"),
-                "status": arguments.get("status"),
             },
         )
         records = data.get("records") or []
@@ -146,6 +147,8 @@ class SpringBootMovieTicketMCP:
             message=self._movie_search_message(
                 movies,
                 recommendation_criteria,
+                genre=arguments.get("genre"),
+                keyword=keyword,
             ),
         )
 
@@ -875,6 +878,18 @@ class SpringBootMovieTicketMCP:
             or item.get("coverUrl")
             or item.get("image")
         )
+        upcoming = item.get("upcomingShowtimes") or []
+        showtimes = [
+            {
+                "showtimeId": s.get("showtimeId"),
+                "cinemaName": s.get("cinemaName"),
+                "hallName": s.get("hallName"),
+                "startAt": s.get("startAt"),
+                "price": s.get("price"),
+            }
+            for s in upcoming
+            if isinstance(s, dict)
+        ]
         return {
             "movieId": item.get("id") or item.get("movieId"),
             "movieName": item.get("name") or item.get("movieName"),
@@ -884,6 +899,7 @@ class SpringBootMovieTicketMCP:
             "poster": poster,
             "posterUrl": poster,
             "status": item.get("statusDesc") or item.get("status"),
+            "upcomingShowtimes": showtimes,
         }
 
     def _format_showtime_movies(
@@ -981,24 +997,78 @@ class SpringBootMovieTicketMCP:
         criteria: Any,
         cinema_name: str | None = None,
         has_showtimes: bool = False,
+        genre: Any = None,
+        keyword: Any = None,
     ) -> str:
         count = len(movies)
-        scope = f"在{cinema_name}" if cinema_name else "在票务数据库中"
-        suffix = "有排片的影片" if has_showtimes else "影片"
+        genre_label = str(genre or "").strip()
+        keyword_label = str(keyword or "").strip()
+
+        if count == 0:
+            if genre_label:
+                return f"暂时没有找到{genre_label}类型的影片，要不要换个类型试试？"
+            if keyword_label:
+                return f"没有找到与「{keyword_label}」相关的影片，换个关键词试试？"
+            if cinema_name:
+                return f"{cinema_name}暂时没有正在上映的影片。"
+            return "当前没有正在上映的影片，过几天再来看看吧。"
+
+        head = self._movie_search_head(count, genre_label, keyword_label, criteria, cinema_name, has_showtimes)
+        detail = self._movie_showtime_lines(movies)
+        if detail:
+            return f"{head}\n\n{detail}"
+        return head
+
+    @staticmethod
+    def _movie_search_head(
+        count: int,
+        genre_label: str,
+        keyword_label: str,
+        criteria: Any,
+        cinema_name: str | None,
+        has_showtimes: bool,
+    ) -> str:
+        if genre_label:
+            return f"为你找到了 {count} 部{genre_label}片"
+        if keyword_label:
+            return f"为你找到了 {count} 部与「{keyword_label}」相关的影片"
         labels = {
-            "couple": "适合情侣一起观看",
-            "family": "适合亲子或家庭观看",
+            "couple": "适合情侣一起观看的",
+            "family": "适合亲子或家庭的",
             "high_rating": "高分口碑",
-            "box_office": "当前可购",
-            "hot": "当前热映",
-            "general": "值得关注",
+            "box_office": "当前可购的",
+            "hot": "当前热映的",
+            "general": "值得关注的",
         }
         label = labels.get(str(criteria or "").strip())
         if label:
-            return f"{scope}找到 {count} 部{label}的{suffix}。"
+            return f"为你找到了 {count} 部{label}影片"
         if cinema_name:
-            return f"已在{cinema_name}找到 {count} 部{suffix}。"
-        return f"已在票务数据库中找到 {count} 部{suffix}。"
+            action = "正在排片" if has_showtimes else "正在上映"
+            return f"{cinema_name}有 {count} 部电影{action}"
+        return f"当前有 {count} 部电影正在上映"
+
+    @staticmethod
+    def _movie_showtime_lines(movies: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for movie in movies[:5]:  # 最多列出 5 部
+            name = movie.get("movieName", "")
+            showtimes = movie.get("upcomingShowtimes") or []
+            if not showtimes:
+                continue
+            parts: list[str] = []
+            for st in showtimes[:2]:  # 每部最多 2 场
+                cinema = st.get("cinemaName") or ""
+                hall = st.get("hallName") or ""
+                start = st.get("startAt") or ""
+                price = st.get("price") or ""
+                price_text = f" {price}元" if price else ""
+                time_text = str(start)[:16].replace("T", " ") if start else ""
+                where = f"{cinema} {hall}".strip()
+                parts.append(f"{where} {time_text}{price_text}")
+            if parts:
+                lines.append(f"• 《{name}》" + "；".join(parts))
+        return "\n".join(lines)
 
     def _pick_movie(
         self,
