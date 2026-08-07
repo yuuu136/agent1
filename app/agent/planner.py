@@ -90,7 +90,7 @@ class TaskPlanner:
             return AgentPlan(
                 action="confirm_selection",
                 reason="用户已选择零食",
-                params=self._pick(slots, ["snackIds"]),
+                params=self._pick(slots, ["snackIds", "snackItems"]),
                 state="selecting_snacks",
             )
 
@@ -165,6 +165,36 @@ class TaskPlanner:
             return AgentPlan(
                 action="list_orders",
                 reason="用户查看订单记录",
+                params={},
+                state="answering",
+            )
+
+        if nlu.intent == "refund_status_query":
+            if slots.get("orderId"):
+                return AgentPlan(
+                    action="get_refund_status",
+                    reason="用户查询当前订单退票/退款状态",
+                    params=self._pick(slots, ["orderId"]),
+                    state="answering",
+                )
+            return AgentPlan(
+                action="list_orders",
+                reason="用户查询退票/退款状态但未指定订单，先展示订单列表",
+                params={},
+                state="answering",
+            )
+
+        if nlu.intent == "refund_order":
+            if slots.get("orderId"):
+                return AgentPlan(
+                    action="refund_order",
+                    reason="用户申请当前订单退票退款",
+                    params=self._pick(slots, ["orderId"]),
+                    state="refunding",
+                )
+            return AgentPlan(
+                action="list_orders",
+                reason="用户申请退票但未指定订单，先展示可操作订单",
                 params={},
                 state="answering",
             )

@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from copy import deepcopy
 from datetime import datetime
 import json
+import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -443,13 +444,17 @@ class AgentService:
 
         if plan.action == "confirm_selection" and plan.params.get("snackIds"):
             snack_ids = plan.params.get("snackIds") or []
+            snack_items = plan.params.get("snackItems") or []
             state.slots["snackIds"] = snack_ids
+            if snack_items:
+                state.slots["snackItems"] = snack_items
             state.selected.pop("snack_candidates", None)
-            result.data = {"snackIds": snack_ids}
+            result.data = {"snackIds": snack_ids, "snackItems": snack_items}
             applied = self._apply_snacks_to_order(
                 state,
                 result,
                 snack_ids,
+                snack_items=snack_items,
                 jwt=plan.params.get("jwt"),
             )
             if not result.success:
@@ -500,6 +505,8 @@ class AgentService:
             "orderId",
             "lockId",
             "snackIds",
+            "snackItems",
+            "snackRequests",
             "movieId",
             "movieName",
             "cinemaId",
@@ -676,8 +683,8 @@ class AgentService:
                     seat
                     for seat in seats
                     if isinstance(seat, dict)
-                    and self._as_int(seat.get("row")) == row_no
-                    and self._as_int(seat.get("number")) == seat_no
+                    and self._seat_row(seat) == row_no
+                    and self._seat_number(seat) == seat_no
                 ),
                 None,
             )
@@ -697,14 +704,24 @@ class AgentService:
         if missing:
             result.data.clear()
             result.data.update(seat_map_data)
-            result.message = f"座位图中没有找到：{'、'.join(missing)}。请重新选择座位。"
+            self._set_seat_retry_message(
+                result,
+                seats,
+                positions,
+                prefix=f"座位图中没有找到：{'、'.join(missing)}。",
+            )
             state.state = "selecting_seats"
             state.pending_action = "get_seats"
             return
         if unavailable:
             result.data.clear()
             result.data.update(seat_map_data)
-            result.message = f"指定座位已被占用：{'、'.join(unavailable)}。请重新选择座位。"
+            self._set_seat_retry_message(
+                result,
+                seats,
+                positions,
+                prefix=f"指定座位已被占用：{'、'.join(unavailable)}。",
+            )
             state.state = "selecting_seats"
             state.pending_action = "get_seats"
             return
@@ -746,6 +763,15 @@ class AgentService:
             f"已按你的要求选择{'、'.join(self._seat_position_labels(positions))}，"
             "座位已锁定，订单已创建，可以直接支付。"
         )
+        if self._apply_requested_snacks_after_lock(
+            state,
+            result,
+            lock_result.data,
+            jwt=jwt,
+        ):
+            result.data["paymentReady"] = True
+            return
+
         offered = self._offer_snacks_after_lock(
             state,
             result,
@@ -784,6 +810,86 @@ class AgentService:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _seat_row(self, seat: dict[str, Any]) -> int | None:
+        return self._as_int(seat.get("row") or seat.get("rowNo"))
+
+    def _seat_number(self, seat: dict[str, Any]) -> int | None:
+        return self._as_int(seat.get("number") or seat.get("seatNo"))
+
+    def _is_selectable_seat(self, seat: dict[str, Any]) -> bool:
+        if seat.get("seatId") in [None, ""]:
+            return False
+        status = str(seat.get("status") or "available").lower()
+        return status not in {"locked", "sold", "unavailable", "couple"}
+
+    def _set_seat_retry_message(
+        self,
+        result: ToolResult,
+        seats: list[Any],
+        positions: list[Any],
+        prefix: str,
+    ) -> None:
+        suggestions = self._suggest_available_seats(seats, positions)
+        if suggestions:
+            result.message = f"{prefix} 可选：{'、'.join(suggestions)}。"
+            result.suggestions = suggestions
+        else:
+            result.message = f"{prefix} 请在座位图里重新选择座位。"
+            result.suggestions = ["选中间", "选后排", "换一场"]
+
+    def _suggest_available_seats(
+        self,
+        seats: list[Any],
+        positions: list[Any],
+        limit: int = 4,
+    ) -> list[str]:
+        requested = [
+            (self._as_int(position.get("rowNo")), self._as_int(position.get("seatNo")))
+            for position in positions
+            if isinstance(position, dict)
+        ]
+        requested = [
+            (row_no, seat_no)
+            for row_no, seat_no in requested
+            if row_no is not None and seat_no is not None
+        ]
+        available: list[tuple[int, int]] = []
+        for seat in seats:
+            if not isinstance(seat, dict) or not self._is_selectable_seat(seat):
+                continue
+            row_no = self._seat_row(seat)
+            seat_no = self._seat_number(seat)
+            if row_no is None or seat_no is None:
+                continue
+            available.append((row_no, seat_no))
+        if not available:
+            return []
+
+        def score(candidate: tuple[int, int]) -> tuple[int, int, int, int]:
+            row_no, seat_no = candidate
+            if not requested:
+                return (0, row_no, seat_no, 0)
+            distances = []
+            for requested_row, requested_seat in requested:
+                same_row_penalty = 0 if row_no == requested_row else 1
+                same_number_penalty = 0 if seat_no == requested_seat else 1
+                distance = abs(row_no - requested_row) + abs(seat_no - requested_seat)
+                distances.append((same_row_penalty + same_number_penalty, distance))
+            best_penalty, best_distance = min(distances)
+            return (best_penalty, best_distance, row_no, seat_no)
+
+        labels: list[str] = []
+        seen: set[str] = set()
+        for row_no, seat_no in sorted(set(available), key=score):
+            label = f"{row_no}排{seat_no}座"
+            if label in seen:
+                continue
+            labels.append(label)
+            seen.add(label)
+            if len(labels) >= limit:
+                break
+        return labels
 
     def _seat_position_labels(self, positions: list[Any]) -> list[str]:
         labels = []
@@ -836,6 +942,104 @@ class AgentService:
         result.suggestions = ["不要零食", "直接支付"]
         return True
 
+    def _apply_requested_snacks_after_lock(
+        self,
+        state: AgentState,
+        result: ToolResult,
+        order_data: dict[str, Any],
+        jwt: str | None = None,
+    ) -> bool:
+        requests = state.slots.get("snackRequests")
+        if not isinstance(requests, list) or not requests or not jwt:
+            return False
+
+        order_id = order_data.get("orderId") or state.slots.get("orderId")
+        if not order_id:
+            return False
+
+        snack_result = agent_toolbox.execute(
+            AgentPlan(
+                action="recommend_snacks",
+                params={
+                    "orderId": order_id,
+                    "ticketCount": state.slots.get("ticketCount"),
+                    "cinemaId": order_data.get("cinemaId") or state.slots.get("cinemaId"),
+                    "cinemaName": order_data.get("cinemaName") or state.slots.get("cinemaName"),
+                    "jwt": jwt,
+                },
+                state="selecting_snacks",
+            ),
+            state,
+        )
+        snacks = snack_result.data.get("snacks") if snack_result.success else None
+        if not snacks:
+            return False
+
+        snack_items: list[dict[str, int]] = []
+        selected_labels: list[str] = []
+        for request in requests:
+            if not isinstance(request, dict):
+                continue
+            requested_name = str(request.get("name") or "").strip()
+            match = self._match_snack_option(snacks, requested_name)
+            if not match or match.get("snackId") in [None, ""]:
+                continue
+            quantity = self._as_int(request.get("quantity")) or 1
+            if quantity <= 0:
+                quantity = 1
+            snack_id = match["snackId"]
+            snack_items.append({"snackId": snack_id, "quantity": quantity})
+            unit = str(request.get("unit") or "份")
+            selected_labels.append(f"{quantity}{unit}{match.get('name') or requested_name}")
+
+        if not snack_items:
+            return False
+
+        state.slots["snackIds"] = [item["snackId"] for item in snack_items]
+        state.slots["snackItems"] = snack_items
+        applied = self._apply_snacks_to_order(
+            state,
+            result,
+            state.slots["snackIds"],
+            snack_items=snack_items,
+            jwt=jwt,
+        )
+        if not applied:
+            return False
+
+        state.state = "paying"
+        state.pending_action = "pay_order"
+        result.data["order"] = state.selected.get("order", order_data.copy())
+        amount = result.data.get("totalAmount") or result.data.get("amount")
+        amount_text = f"，合计{amount}元" if amount not in [None, ""] else ""
+        result.message = (
+            "座位已锁定，订单已创建，"
+            f"已按你的要求加入{'、'.join(selected_labels)}{amount_text}，可以直接支付。"
+        )
+        result.suggestions = ["确认支付", "查看订单", "取消支付"]
+        return True
+
+    def _match_snack_option(
+        self,
+        snacks: list[Any],
+        requested_name: str,
+    ) -> dict[str, Any] | None:
+        normalized_request = self._normalize_match_text(requested_name)
+        if not normalized_request:
+            return None
+        for snack in snacks:
+            if not isinstance(snack, dict):
+                continue
+            snack_name = self._normalize_match_text(snack.get("name"))
+            if not snack_name:
+                continue
+            if normalized_request in snack_name or snack_name in normalized_request:
+                return snack
+        return None
+
+    def _normalize_match_text(self, value: Any) -> str:
+        return re.sub(r"[\s，。,.!?！？、:：;；]+", "", str(value or "")).casefold()
+
     def _resume_payment_after_optional_step(
         self,
         state: AgentState,
@@ -869,20 +1073,25 @@ class AgentService:
         state: AgentState,
         result: ToolResult,
         snack_ids: list[Any],
+        snack_items: list[Any] | None = None,
         jwt: str | None = None,
     ) -> bool:
         order_id = state.slots.get("orderId")
         if not order_id or not jwt:
             return False
 
+        params = {
+            "orderId": order_id,
+            "snackIds": snack_ids,
+            "jwt": jwt,
+        }
+        if snack_items:
+            params["snackItems"] = snack_items
+
         snack_result = agent_toolbox.execute(
             AgentPlan(
                 action="replace_order_snacks",
-                params={
-                    "orderId": order_id,
-                    "snackIds": snack_ids,
-                    "jwt": jwt,
-                },
+                params=params,
                 state="selecting_snacks",
             ),
             state,

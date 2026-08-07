@@ -76,6 +76,8 @@ def planner_node(data: AgentGraphState) -> dict[str, Any]:
         "create_order",
         "pay_order",
         "issue_ticket",
+        "refund_order",
+        "get_refund_status",
         "get_order",
         "list_orders",
     } and jwt:

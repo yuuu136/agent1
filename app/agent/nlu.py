@@ -148,6 +148,13 @@ NON_MOVIE_TEXTS = GREETING_TEXTS | ACK_TEXTS | SHOWTIME_QUERY_TEXTS | {
     "换个位置",
     "换座位",
     "更换座位",
+    "退了",
+    "退了吧",
+    "退掉",
+    "退掉吧",
+    "帮我退了",
+    "这张票退了",
+    "这个票退了",
 }
 MOVIE_SEARCH_TEXTS = {
     "最近热映",
@@ -257,6 +264,14 @@ GENERIC_BOOKING_TEXTS = {
 IMPLICIT_SINGLE_TICKET_PATTERN = re.compile(
     r"(?:购买|预订|买|订|来)\s*张"
 )
+SNACK_ALIASES = {
+    "可乐": ("可乐", "可口可乐", "cola", "coke"),
+    "爆米花": ("爆米花",),
+    "雪碧": ("雪碧",),
+    "饮料": ("饮料", "汽水"),
+    "套餐": ("套餐",),
+    "小吃": ("小吃", "零食"),
+}
 
 
 def _normalize_short_text(text: str) -> str:
@@ -327,6 +342,9 @@ class RuleBasedNLU:
                 "select_coupon": "select_coupon",
                 "confirm_order": "confirm_order",
                 "pay_order": "pay_order",
+                "get_order": "order_query",
+                "refund_order": "refund_order",
+                "get_refund_status": "refund_status_query",
             }.get(event)
             if event_intent:
                 return event_intent
@@ -344,6 +362,10 @@ class RuleBasedNLU:
             return "skip_coupon"
         if self._is_order_query_text(text):
             return "order_query"
+        if self._is_refund_status_query_text(text):
+            return "refund_status_query"
+        if self._is_refund_request_text(text):
+            return "refund_order"
         if any(word in text for word in ["退票", "改签", "规则", "政策", "怎么处理", "FAQ"]):
             return "faq"
         if self._is_price_preference_text(text):
@@ -377,12 +399,12 @@ class RuleBasedNLU:
             ]
         ):
             return "book_ticket"
-        if any(word in text for word in ["零食", "爆米花", "饮料", "套餐", "小吃"]):
-            return "snack"
         if any(word in text for word in ["优惠", "优惠券", "券", "折扣", "便宜"]):
             return "coupon" if "券" in text or "优惠" in text else "select_or_modify"
         if self._has_booking_slot_text(text):
             return "book_ticket"
+        if self._extract_snack_requests(text):
+            return "snack"
         if any(
             word in text
             for word in [
@@ -456,6 +478,9 @@ class RuleBasedNLU:
             slots["pricePreference"] = "lower"
         if self._is_time_preference_text(text):
             slots["timePreference"] = "later" if "晚" in text else "earlier"
+        snack_requests = self._extract_snack_requests(text)
+        if snack_requests and not self._is_negative_snack_request(text):
+            slots["snackRequests"] = snack_requests
 
         movie_name = payload.get("movieName") or payload.get("movie_name")
         if movie_name:
@@ -483,6 +508,9 @@ class RuleBasedNLU:
             "couponId",
             "snackIds",
             "snackId",
+            "snackItems",
+            "snackRequests",
+            "quantity",
             "location",
             "city",
             "cinemaName",
@@ -509,6 +537,10 @@ class RuleBasedNLU:
 
         if event == "select_snacks" and slots.get("snackId"):
             slots["snackIds"] = [slots["snackId"]]
+            quantity = self._positive_int(slots.get("quantity")) or 1
+            slots["snackItems"] = [
+                {"snackId": slots["snackId"], "quantity": quantity}
+            ]
         if event == "select_coupon" and slots.get("couponId"):
             slots["couponId"] = slots["couponId"]
 
@@ -618,6 +650,44 @@ class RuleBasedNLU:
             tens = CHINESE_NUMBERS.get(value[0])
             return tens * 10 if tens is not None else None
         return None
+
+    def _extract_snack_requests(self, text: str) -> list[dict[str, Any]]:
+        requests: list[dict[str, Any]] = []
+        normalized = text.casefold()
+        for canonical, aliases in SNACK_ALIASES.items():
+            matched_alias = next(
+                (alias for alias in aliases if alias.casefold() in normalized),
+                None,
+            )
+            if not matched_alias:
+                continue
+            quantity, unit = self._extract_quantity_near_text(text, matched_alias)
+            item = {"name": canonical, "quantity": quantity or 1}
+            if unit:
+                item["unit"] = unit
+            if item not in requests:
+                requests.append(item)
+        return requests
+
+    def _extract_quantity_near_text(self, text: str, keyword: str) -> tuple[int | None, str | None]:
+        number_pattern = r"(?P<count>\d+|[一二两三四五六七八九十俩]{1,3})"
+        unit_pattern = r"(?P<unit>瓶|杯|份|桶|个|套|包|盒)?"
+        escaped = re.escape(keyword)
+        before = re.search(
+            rf"{number_pattern}\s*{unit_pattern}\s*{escaped}",
+            text,
+            re.IGNORECASE,
+        )
+        if before:
+            return self._parse_number_text(before.group("count")), before.group("unit")
+        after = re.search(
+            rf"{escaped}\s*{number_pattern}\s*{unit_pattern}",
+            text,
+            re.IGNORECASE,
+        )
+        if after:
+            return self._parse_number_text(after.group("count")), after.group("unit")
+        return None, None
 
     def _extract_time(self, text: str) -> str | None:
         if (
@@ -959,11 +1029,56 @@ class RuleBasedNLU:
 
     def _is_order_query_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
+        if "退票" in normalized or "退款" in normalized:
+            return False
         if any(phrase in normalized for phrase in ORDER_QUERY_PHRASES):
             return True
         return bool(
             re.search(r"(?:查|查看|查询|看看).{0,3}订单", normalized)
         )
+
+    def _is_refund_request_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        if not any(
+            marker in normalized
+            for marker in [
+                "退票",
+                "退款",
+                "申请退款",
+                "退了",
+                "退掉",
+                "退单",
+                "不要这张票",
+                "这张票不要",
+                "这张票退",
+                "这个票退",
+            ]
+        ):
+            return False
+        if any(marker in normalized for marker in ["规则", "政策", "说明", "怎么", "如何", "能不能"]):
+            return False
+        return True
+
+    def _is_refund_status_query_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        return any(
+            marker in normalized
+            for marker in [
+                "退票状态",
+                "退款状态",
+                "退票结果",
+                "退款结果",
+                "退票成功了吗",
+                "退款成功了吗",
+            ]
+        )
+
+    def _positive_int(self, value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
 
     def _is_movie_search_text(self, text: str) -> bool:
         normalized = _normalize_short_text(text)

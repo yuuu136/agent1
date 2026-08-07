@@ -39,6 +39,8 @@ class SpringBootMovieTicketMCP:
             "create_order": self.create_order,
             "pay_order": self.pay_order,
             "issue_ticket": self.issue_ticket,
+            "refund_order": self.refund_order,
+            "get_refund_status": self.get_refund_status,
             "get_order": self.get_order,
             "list_orders": self.list_orders,
         }
@@ -223,15 +225,18 @@ class SpringBootMovieTicketMCP:
         )
         seats = []
         for row in data.get("rows") or []:
-            row_no = row.get("rowNo")
+            row_no = self._first_present(row, "rowNo", "row")
             for seat in row.get("seats") or []:
                 seats.append(
                     {
-                        "seatId": seat.get("id"),
-                        "row": row_no,
-                        "number": seat.get("seatNo"),
-                        "status": self._normalize_seat_status(seat.get("status")),
-                        "price": seat.get("price") or data.get("basePrice"),
+                        "seatId": self._first_present(seat, "id", "seatId"),
+                        "row": self._first_present(seat, "rowNo", "row") or row_no,
+                        "number": self._first_present(seat, "seatNo", "number"),
+                        "status": self._normalize_seat_status(
+                            self._first_present(seat, "status", "seatStatus")
+                        ),
+                        "price": self._first_present(seat, "price", "unitPrice")
+                        or data.get("basePrice"),
                     }
                 )
         return ToolResult(
@@ -345,14 +350,7 @@ class SpringBootMovieTicketMCP:
 
     def replace_order_snacks(self, arguments: dict[str, Any]) -> ToolResult:
         order_id = self._required_long(arguments.get("orderId"), "订单 ID")
-        snack_ids = self._long_list(arguments.get("snackIds") or [], "零食 ID")
-        items = [
-            {
-                "snackId": snack_id,
-                "quantity": 1,
-            }
-            for snack_id in snack_ids
-        ]
+        items = self._snack_items(arguments)
         raw = self._put_business(
             f"/api/user/orders/{order_id}/snacks",
             arguments,
@@ -367,6 +365,34 @@ class SpringBootMovieTicketMCP:
                 f"零食金额 {self._format_yuan(data.get('snackAmount'))}，"
                 f"合计 {self._format_yuan(data.get('totalAmount'))}。"
             ),
+        )
+
+    def refund_order(self, arguments: dict[str, Any]) -> ToolResult:
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        raw = self._post_business(
+            f"/api/user/orders/{order_id}/refund",
+            arguments,
+            {},
+        )
+        data = self._format_refund(raw, fallback_order_id=order_id)
+        return ToolResult(
+            tool_name="spring_boot.refund_order",
+            data=data,
+            message=data.get("message") or self._refund_message(data),
+        )
+
+    def get_refund_status(self, arguments: dict[str, Any]) -> ToolResult:
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        raw = self._get_business(
+            f"/api/user/orders/{order_id}/refund",
+            arguments,
+            {},
+        )
+        data = self._format_refund(raw, fallback_order_id=order_id)
+        return ToolResult(
+            tool_name="spring_boot.get_refund_status",
+            data=data,
+            message=data.get("message") or self._refund_message(data),
         )
 
     def create_order(self, arguments: dict[str, Any]) -> ToolResult:
@@ -450,10 +476,19 @@ class SpringBootMovieTicketMCP:
             {},
         )
         data = self._format_order(raw, order_id)
+        status = str(data.get("status") or "").upper()
+        if status == "TICKETED" or data.get("ticketStatus") == "issued":
+            message = "支付成功，电子票已出票。"
+        elif status in {"PAYMENT_PENDING", "PENDING"}:
+            message = "订单仍待支付，请完成支付宝沙箱支付后再查看。"
+        elif status in {"CANCELLED", "CANCELED", "CLOSED"}:
+            message = "订单已关闭或取消。"
+        else:
+            message = "订单已加载。"
         return ToolResult(
             tool_name="spring_boot.get_order",
             data=data,
-            message="订单已加载。",
+            message=message,
         )
 
     def list_orders(self, arguments: dict[str, Any]) -> ToolResult:
@@ -536,6 +571,13 @@ class SpringBootMovieTicketMCP:
         if parsed <= 0:
             raise ValueError(f"{label}无效。")
         return parsed
+
+    def _first_present(self, data: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = data.get(key)
+            if value not in [None, ""]:
+                return value
+        return None
 
     def _long_list(self, values: Any, label: str) -> list[int]:
         if not isinstance(values, list):
@@ -656,6 +698,23 @@ class SpringBootMovieTicketMCP:
             "status": raw.get("status"),
         }
 
+    def _snack_items(self, arguments: dict[str, Any]) -> list[dict[str, int]]:
+        raw_items = arguments.get("snackItems") or arguments.get("items")
+        if isinstance(raw_items, list) and raw_items:
+            items: list[dict[str, int]] = []
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                snack_id = self._required_long(item.get("snackId"), "零食 ID")
+                quantity = int(item.get("quantity") or 1)
+                if quantity <= 0:
+                    continue
+                items.append({"snackId": snack_id, "quantity": quantity})
+            return items
+
+        snack_ids = self._long_list(arguments.get("snackIds") or [], "零食 ID")
+        return [{"snackId": snack_id, "quantity": 1} for snack_id in snack_ids]
+
     def _format_snack_selection(
         self,
         raw: dict[str, Any],
@@ -696,6 +755,30 @@ class SpringBootMovieTicketMCP:
             "amount": raw.get("amount"),
             "inventoryStatus": raw.get("inventoryStatus"),
         }
+
+    def _format_refund(
+        self,
+        raw: dict[str, Any],
+        fallback_order_id: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "orderId": raw.get("orderId") or fallback_order_id,
+            "status": raw.get("status"),
+            "amount": raw.get("amount"),
+            "outRequestNo": raw.get("outRequestNo"),
+            "message": raw.get("message"),
+            "updatedAt": raw.get("updatedAt"),
+            "source": "spring_boot_database",
+        }
+
+    def _refund_message(self, data: dict[str, Any]) -> str:
+        status = str(data.get("status") or "").upper()
+        amount = self._format_yuan(data.get("amount"))
+        if status == "SUCCESS":
+            return f"退票申请已完成，退款金额 {amount}。"
+        if status == "FAIL":
+            return data.get("message") or "退票失败，请查看订单详情或联系客服。"
+        return f"退票申请已提交，当前状态：{data.get('status') or '处理中'}，金额 {amount}。"
 
     def _format_yuan(self, value: Any) -> str:
         if value in [None, ""]:

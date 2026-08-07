@@ -21,6 +21,7 @@ CARD_TYPE_MAP = {
     "seat_map": "SEAT_MAP",
     "confirm_order": "ORDER_CONFIRM",
     "payment": "PAYMENT",
+    "refund": "REFUND",
     "ticket": "TICKET",
     "alternative": "ALTERNATIVE",
     "location_picker": "LOCATION_PICKER",

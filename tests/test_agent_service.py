@@ -118,6 +118,28 @@ def test_movie_card_includes_poster_payload_for_frontend_card_face() -> None:
     assert cards[0]["payload"]["posterUrl"] == "https://example.com/spider.jpg"
 
 
+def test_get_order_ticketed_result_builds_ticket_card() -> None:
+    cards = card_builder.build(
+        AgentPlan(action="get_order", state="answering"),
+        ToolResult(
+            tool_name="spring_boot.get_order",
+            data={
+                "orderId": 12,
+                "status": "TICKETED",
+                "ticketStatus": "issued",
+                "tickets": [{"ticketCode": "TKT-001"}],
+            },
+            message="支付成功，电子票已出票。",
+        ),
+    )
+
+    assert cards[0]["type"] == "ticket"
+    assert cards[0]["title"] == "电子票"
+    assert cards[0]["actions"][0]["event"] == "view_ticket"
+    assert cards[0]["actions"][0]["label"] == "查看电子票"
+    assert cards[0]["actions"][0]["payload"]["path"] == "/orders/12/tickets"
+
+
 def test_chat_nearby_cinema_uses_spring_database_nearby_api(monkeypatch) -> None:
     captured = {}
 

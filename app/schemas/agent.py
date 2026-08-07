@@ -21,6 +21,8 @@ AgentAction = Literal[
     "create_order",
     "pay_order",
     "issue_ticket",
+    "refund_order",
+    "get_refund_status",
     "get_order",
     "list_orders",
     "cancel",

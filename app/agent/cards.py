@@ -34,7 +34,11 @@ class CardBuilder:
             if result.data.get("ticketStatus") == "issued":
                 return self.ticket_cards(result.data)
             return self.payment_cards(result.data)
+        if plan.action in {"refund_order", "get_refund_status"}:
+            return self.refund_cards(result.data)
         if plan.action == "get_order":
+            if result.data.get("ticketStatus") == "issued":
+                return self.ticket_cards(result.data)
             return self.order_cards([result.data]) if result.data else []
         if plan.action == "list_orders":
             records = result.data.get("records", [])
@@ -127,8 +131,13 @@ class CardBuilder:
                 "type": "snack",
                 "id": item.get("snackId"),
                 "title": item.get("name"),
-                "meta": {"price": item.get("price")},
-                "actions": [{"event": "select_snacks", "label": "加入套餐", "payload": item}],
+                "image": item.get("image"),
+                "meta": {
+                    "price": item.get("price"),
+                    "stock": item.get("availableStock"),
+                },
+                "payload": item,
+                "actions": [{"event": "select_snacks", "label": "加入零食", "payload": item}],
             }
             for item in snacks
         ]
@@ -183,17 +192,31 @@ class CardBuilder:
         ]
 
     def ticket_cards(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        order_id = data.get("orderId")
         return [
             {
                 "type": "ticket",
-                "id": data.get("orderId") or "ticket",
+                "id": order_id or "ticket",
                 "title": "电子票",
                 "meta": {
-                    "orderId": data.get("orderId"),
+                    "orderId": order_id,
                     "ticketStatus": data.get("ticketStatus"),
                     "calendar": data.get("calendar"),
                     "notification": data.get("notification"),
                 },
+                "payload": data,
+                "actions": [
+                    {
+                        "event": "view_ticket",
+                        "label": "查看电子票",
+                        "payload": {
+                            "orderId": order_id,
+                            "path": f"/orders/{order_id}/tickets" if order_id else "",
+                        },
+                    }
+                ]
+                if order_id
+                else [],
             }
         ]
 
@@ -206,10 +229,27 @@ class CardBuilder:
                 "subtitle": self._order_subtitle(item),
                 "meta": self._order_meta(item),
                 "payload": item,
-                "actions": [],
+                "actions": self._order_actions(item),
             }
             for item in orders
             if isinstance(item, dict)
+        ]
+
+    def refund_cards(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "refund",
+                "id": data.get("orderId") or "refund",
+                "title": "退票结果",
+                "meta": {
+                    "订单号": data.get("orderId"),
+                    "状态": data.get("status"),
+                    "金额": self._format_amount(data.get("amount")),
+                    "退款请求号": data.get("outRequestNo"),
+                    "更新时间": data.get("updatedAt"),
+                },
+                "payload": data,
+            }
         ]
 
     def _order_meta(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -231,6 +271,32 @@ class CardBuilder:
             "状态": data.get("statusDesc") or data.get("status"),
         }
         return {key: value for key, value in meta.items() if value not in [None, ""]}
+
+    def _order_actions(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        status = str(data.get("status") or "").upper()
+        order_id = data.get("orderId") or data.get("orderNo")
+        if not order_id:
+            return []
+        actions: list[dict[str, Any]] = [
+            {"event": "get_order", "label": "查看订单", "payload": data}
+        ]
+        if status in {"TICKETED", "PAID", "SUCCESS"}:
+            actions.append(
+                {
+                    "event": "refund_order",
+                    "label": "申请退票",
+                    "payload": data,
+                }
+            )
+        if status in {"REFUNDING", "REFUND_PENDING", "REFUNDED"}:
+            actions.append(
+                {
+                    "event": "get_refund_status",
+                    "label": "查看退款",
+                    "payload": data,
+                }
+            )
+        return actions
 
     def _order_subtitle(self, data: dict[str, Any]) -> str:
         parts = [
