@@ -175,7 +175,7 @@ class SpringBootMovieTicketMCP:
                 return ToolResult(
                     tool_name="spring_boot.search_showtimes",
                     data={"showtimes": [], "movies": movies},
-                    message=f"票务数据库中没有找到《{movie_name}》。",
+                    message=f"没有找到《{movie_name}》的相关信息。",
                 )
             movie_id = movie.get("movieId")
         elif not movie_id and arguments.get("genre"):
@@ -188,7 +188,7 @@ class SpringBootMovieTicketMCP:
                 return ToolResult(
                     tool_name="spring_boot.search_showtimes",
                     data={"showtimes": [], "movies": movies},
-                    message=f"票务数据库中没有找到{arguments.get('genre')}类型影片。",
+                    message=f"没有找到{arguments.get('genre')}类型的影片，换个类型试试？",
                 )
 
         date_value = self._spring_date(arguments.get("date"))
@@ -1014,12 +1014,12 @@ class SpringBootMovieTicketMCP:
 
         if count == 0:
             if genre_label:
-                return f"暂时没有找到{genre_label}类型的影片，要不要换个类型试试？"
+                return f"{genre_label}类型的影片暂时没有排片。要不要看看现在有哪些电影正在上映？"
             if keyword_label:
                 return f"没有找到与「{keyword_label}」相关的影片，换个关键词试试？"
             if cinema_name:
-                return f"{cinema_name}暂时没有正在上映的影片。"
-            return "当前没有正在上映的影片，过几天再来看看吧。"
+                return f"{cinema_name}暂时没有正在上映的影片，看看其他影院？"
+            return "当前没有正在上映的影片。过几天再来看看吧。"
 
         head = self._movie_search_head(count, genre_label, keyword_label, criteria, cinema_name, has_showtimes)
         detail = self._movie_showtime_lines(movies)
@@ -1235,12 +1235,12 @@ class SpringBootMovieTicketMCP:
         if response_data.get("navigation"):
             return "已匹配到唯一场次，准备进入选座。"
         if showtimes:
-            return f"已在票务数据库中找到 {len(showtimes)} 个符合条件的场次。"
+            return f"为你找到了 {len(showtimes)} 个符合条件的场次。"
 
         constraints = self._showtime_constraints(arguments)
         if constraints:
-            return f"按{constraints}查询，票务数据库中没有符合条件的场次。可以换影院、换时间或换类型。"
-        return "票务数据库中没有符合条件的场次。可以换影院、换时间或换类型。"
+            return f"按{constraints}没有找到合适的场次，可以换影院、换时间或换类型看看。"
+        return "没有找到合适的场次，可以换影院、换时间或换类型看看。"
 
     def _showtime_constraints(self, arguments: dict[str, Any]) -> str:
         parts = []
