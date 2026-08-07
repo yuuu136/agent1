@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.agent.intent_rag import intent_rag_retriever
 from app.schemas.agent import ChatRequest, NLUResult
 
 
@@ -157,6 +158,12 @@ NON_MOVIE_TEXTS = GREETING_TEXTS | ACK_TEXTS | SHOWTIME_QUERY_TEXTS | {
     "这个票退了",
 }
 MOVIE_SEARCH_TEXTS = {
+    "我想看电影",
+    "想看电影",
+    "我要看电影",
+    "看电影",
+    "去看电影",
+    "帮我看电影",
     "最近热映",
     "正在上映",
     "有什么电影",
@@ -169,8 +176,13 @@ MOVIE_SEARCH_TEXTS = {
     "有些什么影片",
     "推荐电影",
     "推荐影片",
+    "帮我推荐电影",
+    "帮我推荐影片",
     "看看电影",
     "查电影",
+    "有电影看吗",
+    "有什么电影看",
+    "有啥电影看",
 }
 PRICE_QUERY_MARKERS = (
     "多少钱",
@@ -272,6 +284,13 @@ SNACK_ALIASES = {
     "套餐": ("套餐",),
     "小吃": ("小吃", "零食"),
 }
+MOVIE_RECOMMENDATION_MARKERS = {
+    "couple": ("情侣", "约会", "恋人", "对象", "浪漫"),
+    "family": ("亲子", "带孩子", "一家人", "合家欢"),
+    "high_rating": ("高分", "高评分", "评分高", "评分最高", "口碑"),
+    "box_office": ("票房", "最卖座"),
+    "hot": ("热映", "热门", "最火"),
+}
 
 
 def _normalize_short_text(text: str) -> str:
@@ -372,6 +391,8 @@ class RuleBasedNLU:
             return "select_or_modify"
         if any(marker in text for marker in PRICE_QUERY_MARKERS):
             return "price_query"
+        if self._is_movie_recommendation_text(text):
+            return "search_movies"
         if self._is_movie_keyword_query(text):
             return "search_movies"
         if self._is_movie_search_text(text):
@@ -401,6 +422,13 @@ class RuleBasedNLU:
             return "book_ticket"
         if any(word in text for word in ["优惠", "优惠券", "券", "折扣", "便宜"]):
             return "coupon" if "券" in text or "优惠" in text else "select_or_modify"
+        intent_match = (
+            intent_rag_retriever.retrieve(text)
+            if self._should_use_intent_rag(text)
+            else None
+        )
+        if intent_match:
+            return intent_match.intent
         if self._has_booking_slot_text(text):
             return "book_ticket"
         if self._extract_snack_requests(text):
@@ -482,13 +510,41 @@ class RuleBasedNLU:
         if snack_requests and not self._is_negative_snack_request(text):
             slots["snackRequests"] = snack_requests
 
+        recommendation_criteria = self._extract_movie_recommendation_criteria(text)
+        if recommendation_criteria and not self._has_explicit_booking_cue(text):
+            slots["recommendationCriteria"] = recommendation_criteria
+            self._add_clear_slots(
+                slots,
+                "movieId",
+                "movieName",
+                "genre",
+                "showtimeId",
+                "seatIds",
+                "seatPositions",
+                "orderId",
+                "lockId",
+                "couponId",
+                "snackIds",
+                "snackItems",
+                "snackRequests",
+                "price",
+                "amount",
+                "status",
+                "expiresAt",
+            )
+
         movie_name = payload.get("movieName") or payload.get("movie_name")
         if movie_name:
             slots["movieName"] = movie_name
         elif intent == "search_movies":
-            movie_keyword = self._extract_movie_search_keyword(text)
-            if movie_keyword:
-                slots["movieName"] = movie_keyword
+            if not recommendation_criteria:
+                movie_keyword = self._extract_movie_search_keyword(text)
+                if movie_keyword:
+                    slots["movieName"] = movie_keyword
+                elif not self._is_movie_search_text(text):
+                    extracted_movie = self._extract_movie_name(text)
+                    if extracted_movie:
+                        slots["movieName"] = extracted_movie
         elif (
             not genre
             and not self._is_movie_search_text(text)
@@ -835,6 +891,9 @@ class RuleBasedNLU:
         value = value.strip(" ，。,.!?！？的")
         if (
             value in {"喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}
+            or value in {"电影", "影片", "片", "片子"}
+            or "片子" in value
+            or "推荐" in value
             or self._is_non_movie_text(value)
         ):
             return None
@@ -1090,6 +1149,83 @@ class RuleBasedNLU:
     def _is_movie_keyword_query(self, text: str) -> bool:
         return self._extract_movie_search_keyword(text) is not None
 
+    def _is_movie_recommendation_text(self, text: str) -> bool:
+        return bool(
+            self._extract_movie_recommendation_criteria(text)
+            and not self._has_explicit_booking_cue(text)
+        )
+
+    def _extract_movie_recommendation_criteria(self, text: str) -> str | None:
+        normalized = _normalize_short_text(text)
+        if not normalized:
+            return None
+
+        for criteria, markers in MOVIE_RECOMMENDATION_MARKERS.items():
+            if any(marker in normalized for marker in markers):
+                return criteria
+
+        if "推荐" in normalized and any(
+            marker in normalized for marker in ["电影", "影片", "片子", "片"]
+        ):
+            return "general"
+        return None
+
+    def _should_use_intent_rag(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        if not normalized:
+            return False
+        markers = [
+            "想",
+            "要",
+            "帮",
+            "找",
+            "查",
+            "看",
+            "推荐",
+            "有",
+            "哪些",
+            "什么",
+            "片",
+            "电影",
+            "影片",
+            "影院",
+            "影城",
+            "附近",
+            "周边",
+            "订单",
+            "票价",
+            "多少钱",
+            "零食",
+            "可乐",
+            "爆米花",
+        ]
+        if not any(marker in normalized for marker in markers):
+            return False
+        if self._looks_like_movie_title(text) and not any(
+            marker in normalized
+            for marker in [
+                "想",
+                "要",
+                "帮",
+                "找",
+                "查",
+                "看",
+                "推荐",
+                "有",
+                "哪些",
+                "什么",
+                "片",
+                "电影",
+                "影片",
+                "影院",
+                "影城",
+                "附近",
+                "周边",
+            ]
+        ):
+            return False
+        return True
+
     def _has_explicit_booking_cue(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
         if any(
@@ -1103,7 +1239,8 @@ class RuleBasedNLU:
                 "影票",
                 "电影票",
                 "张",
-                "票",
+                "买票",
+                "订票",
                 "座",
                 "今晚",
                 "明晚",
@@ -1150,7 +1287,23 @@ class RuleBasedNLU:
         if not match:
             return None
         keyword = match.group("keyword").strip()
-        if keyword in {"什么", "啥", "哪些", "一些", "些", "推荐", "热映"}:
+        generic_keywords = {
+            "什么",
+            "啥",
+            "哪些",
+            "一些",
+            "些",
+            "推荐",
+            "热映",
+            "我想看",
+            "想看",
+            "我要看",
+            "帮我推荐",
+            "推荐一下",
+            "看看",
+            "查一下",
+        }
+        if keyword in generic_keywords:
             return None
         if keyword.startswith(("什么", "啥", "哪些", "有什么", "有啥", "有哪些", "有些")):
             return None

@@ -92,6 +92,22 @@ def test_stream_greeting_ignores_frontend_draft_context() -> None:
     assert "event: done" in response.text
 
 
+def test_agent_cors_allows_lan_frontend_origin() -> None:
+    client = TestClient(app)
+
+    response = client.options(
+        "/api/agent/chat/stream",
+        headers={
+            "Origin": "http://192.168.1.23:8000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://192.168.1.23:8000"
+
+
 def test_movie_card_includes_poster_payload_for_frontend_card_face() -> None:
     cards = card_builder.build(
         AgentPlan(action="search_movies", state="selecting_movie"),

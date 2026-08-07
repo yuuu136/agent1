@@ -78,6 +78,7 @@ class SpringBootMovieTicketMCP:
     def search_movies(self, arguments: dict[str, Any]) -> ToolResult:
         keyword = arguments.get("movieName") or arguments.get("keyword")
         cinema_id = arguments.get("cinemaId")
+        recommendation_criteria = arguments.get("recommendationCriteria")
         if cinema_id:
             data = self._get_business(
                 "/api/user/showtimes",
@@ -94,6 +95,10 @@ class SpringBootMovieTicketMCP:
                 keyword,
                 arguments.get("genre"),
             )
+            movies = self._rank_recommended_movies(
+                movies,
+                recommendation_criteria,
+            )
             cinema = data.get("cinema") or {}
             cinema_name = (
                 cinema.get("name")
@@ -106,9 +111,15 @@ class SpringBootMovieTicketMCP:
                     "movies": movies,
                     "cinemaId": cinema.get("id") or cinema_id,
                     "cinemaName": cinema_name,
+                    "recommendationCriteria": recommendation_criteria,
                     "source": "spring_boot_database",
                 },
-                message=f"已在{cinema_name}找到 {len(movies)} 部有排片的影片。",
+                message=self._movie_search_message(
+                    movies,
+                    recommendation_criteria,
+                    cinema_name=cinema_name,
+                    has_showtimes=True,
+                ),
             )
 
         data = self._get_business(
@@ -124,10 +135,18 @@ class SpringBootMovieTicketMCP:
         )
         records = data.get("records") or []
         movies = [self._format_movie(item) for item in records]
+        movies = self._rank_recommended_movies(movies, recommendation_criteria)
         return ToolResult(
             tool_name="spring_boot.search_movies",
-            data={"movies": movies, "source": "spring_boot_database"},
-            message=f"已在票务数据库中找到 {len(movies)} 部影片。",
+            data={
+                "movies": movies,
+                "recommendationCriteria": recommendation_criteria,
+                "source": "spring_boot_database",
+            },
+            message=self._movie_search_message(
+                movies,
+                recommendation_criteria,
+            ),
         )
 
     def search_showtimes(self, arguments: dict[str, Any]) -> ToolResult:
@@ -924,6 +943,62 @@ class SpringBootMovieTicketMCP:
                 continue
             filtered.append(movie)
         return filtered
+
+    def _rank_recommended_movies(
+        self,
+        movies: list[dict[str, Any]],
+        criteria: Any,
+    ) -> list[dict[str, Any]]:
+        if str(criteria or "").strip() != "couple":
+            return movies
+
+        genre_rank = {
+            "爱情": 3,
+            "喜剧": 2,
+            "动画": 1,
+        }
+
+        def rank(movie: dict[str, Any]) -> tuple[int, float]:
+            genre = str(movie.get("genre") or "")
+            score = movie.get("score")
+            try:
+                numeric_score = float(score)
+            except (TypeError, ValueError):
+                numeric_score = 0.0
+            return (
+                max(
+                    (value for name, value in genre_rank.items() if name in genre),
+                    default=0,
+                ),
+                numeric_score,
+            )
+
+        return sorted(movies, key=rank, reverse=True)
+
+    def _movie_search_message(
+        self,
+        movies: list[dict[str, Any]],
+        criteria: Any,
+        cinema_name: str | None = None,
+        has_showtimes: bool = False,
+    ) -> str:
+        count = len(movies)
+        scope = f"在{cinema_name}" if cinema_name else "在票务数据库中"
+        suffix = "有排片的影片" if has_showtimes else "影片"
+        labels = {
+            "couple": "适合情侣一起观看",
+            "family": "适合亲子或家庭观看",
+            "high_rating": "高分口碑",
+            "box_office": "当前可购",
+            "hot": "当前热映",
+            "general": "值得关注",
+        }
+        label = labels.get(str(criteria or "").strip())
+        if label:
+            return f"{scope}找到 {count} 部{label}的{suffix}。"
+        if cinema_name:
+            return f"已在{cinema_name}找到 {count} 部{suffix}。"
+        return f"已在票务数据库中找到 {count} 部{suffix}。"
 
     def _pick_movie(
         self,

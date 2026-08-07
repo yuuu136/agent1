@@ -61,6 +61,29 @@ Agent project started
 
 说明项目运行成功。
 
+## 前端连接 Agent
+
+本机开发可以使用：
+
+```bash
+.\run_backend.ps1
+```
+
+Agent 会监听 `0.0.0.0:8001`，脚本会打印局域网访问地址，例如：
+
+```text
+局域网访问地址：http://192.168.1.23:8001
+```
+
+如果前端和 Agent 不在同一台机器，前端启动前需要指定：
+
+```bash
+$env:AGENT_BASE_URL="http://运行Agent那台电脑的IP:8001"
+pnpm dev
+```
+
+如果前端重新编译前没有设置 `AGENT_BASE_URL`，默认会连 `http://127.0.0.1:8001`，这只代表前端使用者自己的电脑，不是你电脑上的 Agent。
+
 ## Git 协作流程
 
 主分支说明：

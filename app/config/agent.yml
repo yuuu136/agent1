@@ -7,7 +7,25 @@ server:
   host: 0.0.0.0
   port: 8001
   cors_allow_origins:
-    - "*"
+    - http://localhost:8000
+    - http://localhost:8001
+    - http://localhost:8002
+    - http://localhost:8080
+    - http://localhost:8081
+    - http://localhost:8082
+    - http://localhost:9000
+    - http://localhost:9001
+    - http://localhost:9002
+    - http://127.0.0.1:8000
+    - http://127.0.0.1:8001
+    - http://127.0.0.1:8002
+    - http://127.0.0.1:8080
+    - http://127.0.0.1:8081
+    - http://127.0.0.1:8082
+    - http://127.0.0.1:9000
+    - http://127.0.0.1:9001
+    - http://127.0.0.1:9002
+  cors_allow_origin_regex: "^https?://(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|192\\.168\\.\\d{1,3}\\.\\d{1,3}|10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|172\\.(1[6-9]|2\\d|3[0-1])\\.\\d{1,3}\\.\\d{1,3})(:\\d+)?$"
 
 llm:
   provider: qwen-max

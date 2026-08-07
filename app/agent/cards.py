@@ -55,10 +55,10 @@ class CardBuilder:
                 "poster": item.get("poster") or item.get("posterUrl") or item.get("image"),
                 "posterUrl": item.get("posterUrl") or item.get("poster") or item.get("image"),
                 "meta": {
-                    "genre": item.get("genre"),
-                    "score": item.get("score"),
-                    "duration": item.get("durationMinutes"),
-                    "status": item.get("status"),
+                    "类型：": item.get("genre"),
+                    "评分：": item.get("score"),
+                    "时长：": self._format_duration(item.get("durationMinutes")),
+                    "状态：": item.get("status"),
                 },
                 "payload": item,
                 "actions": [
@@ -335,6 +335,15 @@ class CardBuilder:
             return str(value)
         formatted = str(int(amount)) if amount.is_integer() else f"{amount:.2f}".rstrip("0").rstrip(".")
         return f"{formatted}元"
+
+    def _format_duration(self, value: Any) -> str:
+        if value in [None, ""]:
+            return ""
+        try:
+            minutes = int(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return f"{minutes}分钟"
 
     def _format_date(self, value: Any) -> str:
         parsed = self._parse_datetime(value)

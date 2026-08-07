@@ -20,10 +20,16 @@ app = FastAPI(
     title=agent_config.get("service", {}).get("name", "Movie Ticket Agent Service")
 )
 
+server_config = agent_config.get("server", {})
+cors_allow_origins = server_config.get("cors_allow_origins") or []
+cors_allow_origin_regex = server_config.get("cors_allow_origin_regex")
+allow_all_origins = "*" in cors_allow_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=agent_config.get("server", {}).get("cors_allow_origins", ["*"]),
-    allow_credentials=True,
+    allow_origins=["*"] if allow_all_origins and not cors_allow_origin_regex else cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=not allow_all_origins or bool(cors_allow_origin_regex),
     allow_methods=["*"],
     allow_headers=["*"],
 )

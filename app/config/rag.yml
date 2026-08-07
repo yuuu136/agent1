@@ -17,6 +17,14 @@ embedding:
   batch_size: 10
   timeout_seconds: 60
 
+intent_rag:
+  enabled: true
+  collection_name: movie_ticket_agent_intents_v2
+  top_k: 8
+  score_threshold: 0.42
+  margin_threshold: 0.04
+  embedding_dimension: 512
+
 retrieval_policy:
   use_rag_for:
     - 业务规则解释

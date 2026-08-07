@@ -81,6 +81,7 @@ class TaskPlanner:
                         "cinemaName",
                         "date",
                         "hallType",
+                        "recommendationCriteria",
                     ],
                 ),
                 state="selecting_movie",
