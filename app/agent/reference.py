@@ -1,7 +1,7 @@
 import re
 from typing import Any
 
-from app.agent.nlu import SHOWTIME_QUERY_TEXTS
+from app.agent.intent_catalog import intent_catalog
 from app.schemas.agent import AgentState, NLUResult
 
 
@@ -18,16 +18,8 @@ CHINESE_ORDINALS = {
     "九": 9,
     "十": 10,
 }
-ANY_TIME_TEXTS = {
-    "都可以",
-    "都行",
-    "随便",
-    "不限",
-    "时间不限",
-    "什么时候都可以",
-    "哪个时间都可以",
-    "无所谓",
-}
+ANY_TIME_TEXTS = frozenset(intent_catalog.terms("any_time"))
+SHOWTIME_QUERY_TEXTS = frozenset(intent_catalog.terms("showtime_query"))
 
 
 class ReferenceResolver:

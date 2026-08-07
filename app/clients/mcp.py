@@ -79,6 +79,13 @@ class SpringBootMovieTicketMCP:
         keyword = arguments.get("movieName") or arguments.get("keyword")
         cinema_id = arguments.get("cinemaId")
         recommendation_criteria = arguments.get("recommendationCriteria")
+        genre = arguments.get("genre")
+        if (
+            str(keyword or "").strip().casefold()
+            == str(genre or "").strip().casefold()
+        ):
+            # "爱情电影" is a genre query, not a movie title containing "爱情".
+            keyword = None
         if cinema_id:
             data = self._get_business(
                 "/api/user/showtimes",
@@ -132,6 +139,7 @@ class SpringBootMovieTicketMCP:
                 "size": arguments.get("size", 10),
                 "keyword": keyword,
                 "genre": arguments.get("genre"),
+                "status": arguments.get("status"),
             },
         )
         records = data.get("records") or []

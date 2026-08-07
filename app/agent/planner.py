@@ -284,6 +284,34 @@ class TaskPlanner:
                 and "showtimeId" in nlu.slots
             )
         ):
+            if not slots.get("showtimeId"):
+                missing_plan = self._plan_missing_required_slots(slots)
+                if missing_plan:
+                    return missing_plan
+                return AgentPlan(
+                    action="search_showtimes",
+                    reason="用户指定了座位偏好但尚未选择场次，先返回可选场次",
+                    params=self._pick(
+                        slots,
+                        [
+                            "movieId",
+                            "movieName",
+                            "genre",
+                            "date",
+                            "timeRange",
+                            "ticketCount",
+                            "city",
+                            "cinemaId",
+                            "cinemaName",
+                            "hallType",
+                            "pricePreference",
+                            "timePreference",
+                            "seatPreference",
+                            "seatPositions",
+                        ],
+                    ),
+                    state="selecting_showtime",
+                )
             return AgentPlan(
                 action="get_seats",
                 reason="用户选择了场次，查询座位图",

@@ -19,7 +19,8 @@ embedding:
 
 intent_rag:
   enabled: true
-  collection_name: movie_ticket_agent_intents_v2
+  document_path: data/intent/intent_catalog.md
+  collection_name: movie_ticket_agent_intents_v3
   top_k: 8
   score_threshold: 0.42
   margin_threshold: 0.04
