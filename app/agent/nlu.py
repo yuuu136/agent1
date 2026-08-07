@@ -130,6 +130,8 @@ class RuleBasedNLU:
             return "faq"
         if self._is_price_preference_text(text):
             return "select_or_modify"
+        if self._is_time_preference_text(text):
+            return "select_or_modify"
         if _contains_catalog_term(text, "price_query"):
             return "price_query"
         if self._is_movie_recommendation_text(text):
@@ -270,7 +272,7 @@ class RuleBasedNLU:
         if movie_name:
             slots["movieName"] = movie_name
         elif intent == "search_movies":
-            if not recommendation_criteria:
+            if not recommendation_criteria and not genre:
                 movie_keyword = self._extract_movie_search_keyword(text)
                 if movie_keyword:
                     slots["movieName"] = movie_keyword
@@ -883,6 +885,8 @@ class RuleBasedNLU:
         keyword = match.group("keyword").strip()
         generic_keywords = set(intent_catalog.terms("movie_keyword_generic"))
         if keyword in generic_keywords:
+            return None
+        if keyword in intent_catalog.mapping("genre"):
             return None
         if keyword.startswith(
             intent_catalog.terms("movie_keyword_prefix_excluded")
