@@ -331,8 +331,7 @@ class AgentService:
             )
         except Exception:
             message = (
-                f"{time_greeting}，你好，我是电影票智能体。我可以帮你查附近影院、订电影票、选座，"
-                "也可以回答退改签规则。"
+                f"{time_greeting}～ 现在是{current_time}。想看什么电影，或者有什么偏好吗？随时告诉我。"
             )
 
         return AgentResponse(
@@ -1151,7 +1150,7 @@ class AgentService:
             "ask_movie_or_genre": "想看哪部电影，或者想看什么类型？",
             "ask_time": "想看什么时候的场次？",
             "ask_ticket_count": "需要买几张票？",
-            "smalltalk": "我可以帮你查电影、选场次、选座、搭配零食和优惠券。",
+            "smalltalk": "想看什么电影？告诉我类型或片名，马上帮你找。",
         }
         return messages.get(action, "需要再确认一下信息。")
 
