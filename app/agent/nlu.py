@@ -146,6 +146,7 @@ class RuleBasedNLU:
             return "book_ticket"
         if _contains_catalog_term(text, "nearby_cinema"):
             if "最近" in text and ("上映" in text or "新片" in text
+                                  or "电影" in text or "影片" in text
                                   or self._extract_movie_name(text)
                                   or self._extract_genre(text)):
                 pass  # temporal "最近", not spatial, keep going to movie checks
@@ -622,6 +623,8 @@ class RuleBasedNLU:
         value = value.strip(" ，。,.!?！？的")
         value = re.sub(r"^(?:这个|那个)\s*", "", value)
         value = re.sub(r"\s*(?:这个|那个)$", "", value)
+        if any(keyword in value for keyword in ("什么", "啥", "哪些", "怎么", "怎样", "如何", "哪部", "哪个", "哪家", "哪场")):
+            return None
         if (
             value in intent_catalog.mapping("genre")
             or value in intent_catalog.terms("movie_title_generic")
@@ -919,6 +922,8 @@ class RuleBasedNLU:
         if keyword.startswith(
             intent_catalog.terms("movie_keyword_prefix_excluded")
         ):
+            return None
+        if "有什么" in keyword or "有啥" in keyword or "什么" in keyword:
             return None
         return keyword
 
