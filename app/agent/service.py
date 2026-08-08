@@ -1152,8 +1152,8 @@ class AgentService:
     def _ask_message(self, action: str) -> str:
         messages = {
             "ask_movie_or_genre": "想看哪部电影，或者想看什么类型？",
-            "ask_time": "想看什么时候的场次？",
-            "ask_ticket_count": "需要买几张票？",
+            "ask_time": "想看什么时候的？比如今晚、明天下午，或者周末～",
+            "ask_ticket_count": "好的，想买几张票呢？",
             "smalltalk": (
             "嗨～ 有什么想看的吗？\n\n"
             "你可以告诉我喜欢的类型，比如喜剧、动作、科幻，我帮你看看最近有什么好片。"
@@ -1161,7 +1161,7 @@ class AgentService:
             "还没想好的话也没关系，带你逛逛最近热映的也不错～"
         ),
         }
-        return messages.get(action, "需要再确认一下信息。")
+        return messages.get(action, "还需要确认一下信息。")
 
     def _default_message(self, plan: AgentPlan, result: ToolResult) -> str:
         if not result.success:

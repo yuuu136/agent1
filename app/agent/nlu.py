@@ -184,7 +184,8 @@ class RuleBasedNLU:
             return "book_ticket"
         if _contains_catalog_term(text, "nearby_cinema"):
             if "最近" in text and ("上映" in text or "新片" in text
-                                  or "电影" in text or "影片" in text
+                                  or ("电影" in text and "电影院" not in text)
+                                  or "影片" in text
                                   or self._extract_movie_name(text)
                                   or self._extract_genre(text)):
                 pass  # temporal "最近", not spatial, keep going to movie checks
@@ -739,6 +740,10 @@ class RuleBasedNLU:
         value = re.sub(r"\s*(?:这个|那个)$", "", value)
         if any(keyword in value for keyword in ("什么", "啥", "哪些", "怎么", "怎样", "如何", "哪部", "哪个", "哪家", "哪场")):
             return None
+        if value in ("后天", "前天", "大后天", "大前天",
+                      "后天晚上", "后天下午", "后天上午",
+                      "今天", "明天", "明晚", "今晚", "周末"):
+            return None
         if (
             value in intent_catalog.mapping("genre")
             or value in intent_catalog.terms("movie_title_generic")
@@ -955,14 +960,25 @@ class RuleBasedNLU:
         genre = self._extract_genre(text)
         if genre:
             return True
-        if "电影" not in text and "片" not in text:
+        if "电影" not in text and "影片" not in text and "片" not in text:
             return False
-        if any(phrase in text for phrase in [
+
+        # 显式浏览表达
+        browsing_phrases = [
             "看电影", "看看电影", "看看有什么电影", "有什么电影可以看",
             "想看电影", "想看啥电影", "想看什么电影",
             "想看什么片", "有什么片", "最近有什么片",
-        ]):
+            "有什么好电影", "有什么好看的电影", "有啥好电影",
+            "有什么电影", "有什么影片",
+            "有没有什么电影", "有没有什么好电影",
+        ]
+        if any(phrase in text for phrase in browsing_phrases):
             return True
+
+        # 疑问式的电影/影片推荐请求："xxx有什么xxx电影/影片"
+        if re.search(r"有什么.+电影|有什么.+影片|有哪些.+电影|有哪些.+影片", text):
+            return True
+
         return False
 
     def _is_movie_recommendation_text(self, text: str) -> bool:

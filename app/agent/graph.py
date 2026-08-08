@@ -95,8 +95,8 @@ def ask_node(data: AgentGraphState) -> dict[str, Any]:
     state = data["state"]
     messages = {
         "ask_movie_or_genre": "想看哪部电影，或者想看什么类型？",
-        "ask_time": "想看什么时候的场次？",
-        "ask_ticket_count": "需要买几张票？",
+        "ask_time": "想看什么时候的场次？比如今晚、明天下午，或者周末都行～",
+        "ask_ticket_count": "好的，想买几张票呢？",
         "smalltalk": (
             "嗨～ 有什么想看的吗？\n\n"
             "你可以告诉我喜欢的类型，比如喜剧、动作、科幻，我帮你看看最近有什么好片。"
@@ -105,9 +105,11 @@ def ask_node(data: AgentGraphState) -> dict[str, Any]:
         ),
     }
     action = data["plan"].action
-    message = messages.get(action, "需要再确认一下信息。")
+    message = messages.get(action, "还需要确认一下信息。")
     if action == "ask_movie_or_genre" and state.slots.get("cinemaName"):
         message = f"已选择{state.slots['cinemaName']}，想看哪部电影，或者想看什么类型？"
+    if action == "ask_time" and state.slots.get("movieName"):
+        message = f"好的，《{state.slots['movieName']}》～ 想看什么时候的？比如今晚、明天下午，也可以说周末～"
     return {
         "result": ToolResult(
             tool_name=action,
