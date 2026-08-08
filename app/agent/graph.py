@@ -97,7 +97,12 @@ def ask_node(data: AgentGraphState) -> dict[str, Any]:
         "ask_movie_or_genre": "想看哪部电影，或者想看什么类型？",
         "ask_time": "想看什么时候的场次？",
         "ask_ticket_count": "需要买几张票？",
-        "smalltalk": "想看什么电影？告诉我类型或片名，马上帮你找。",
+        "smalltalk": (
+            "嗨～ 有什么想看的吗？\n\n"
+            "你可以告诉我喜欢的类型，比如喜剧、动作、科幻，我帮你看看最近有什么好片。"
+            "如果心里已经有想看的电影了，直接说片名就行，我来帮你查场次和座位。"
+            "还没想好的话也没关系，带你逛逛最近热映的也不错～"
+        ),
     }
     action = data["plan"].action
     message = messages.get(action, "需要再确认一下信息。")
