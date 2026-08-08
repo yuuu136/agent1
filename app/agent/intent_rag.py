@@ -1,12 +1,15 @@
 import hashlib
-import math
-import re
+import logging
 from dataclasses import dataclass
 
 from app.agent.intent_catalog import intent_catalog
 from app.rag.documents import KnowledgeChunk
+from app.rag.embeddings import QwenEmbeddingClient
 from app.rag.vector_store import ChromaVectorStore
 from app.utils.config_handler import chroma_config, rag_config
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,33 @@ class IntentRAGRetriever:
             raise ValueError("Intent catalog has no intent examples")
         self.enabled = bool(settings.get("enabled", True))
         self.document_path = document_path
+        shared_embedding_settings = rag_config.get("embedding", {})
+        intent_embedding_settings = settings.get("embedding", {})
+        self.embedding_settings = {
+            **shared_embedding_settings,
+            **intent_embedding_settings,
+        }
+        self.embedding_model_name = str(
+            self.embedding_settings.get(
+                "embedding_model_name",
+                "text-embedding-v4",
+            )
+        )
+        self.embedding_client = QwenEmbeddingClient(
+            api_key_env=str(
+                self.embedding_settings.get("api_key_env", "DASHSCOPE_API_KEY")
+            ),
+            base_url=str(
+                self.embedding_settings.get(
+                    "base_url",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                )
+            ),
+            model_name=self.embedding_model_name,
+            timeout_seconds=int(
+                self.embedding_settings.get("timeout_seconds", 60)
+            ),
+        )
         self.corpus_hash = self._corpus_hash(self.examples)
         self.score_threshold = (
             score_threshold
@@ -56,7 +86,8 @@ class IntentRAGRetriever:
             else float(settings.get("margin_threshold", 0.04))
         )
         self.top_k = int(settings.get("top_k", 8))
-        self.embedding_dimension = int(settings.get("embedding_dimension", 512))
+        self._query_cache: dict[str, IntentMatch | None] = {}
+        self._query_cache_size = max(1, int(settings.get("query_cache_size", 256)))
         self.store = ChromaVectorStore(
             persist_directory=chroma_config.get("chroma", {}).get(
                 "persist_directory",
@@ -77,8 +108,24 @@ class IntentRAGRetriever:
         if not self.enabled:
             return None
 
-        query_vector = self._embed(text)
+        cache_key = text.strip()
+        if cache_key in self._query_cache:
+            return self._query_cache[cache_key]
+
+        try:
+            query_vector = self.embedding_client.embed_query(text)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 429:
+                logger.warning("Intent Embedding rate limited; skip RAG for this query")
+            else:
+                logger.warning(
+                    "Intent Embedding unavailable; skip RAG for this query: %s",
+                    exc,
+                )
+            self._remember_query(cache_key, None)
+            return None
         if not query_vector:
+            self._remember_query(cache_key, None)
             return None
 
         retrieved = self.store.search(
@@ -87,6 +134,7 @@ class IntentRAGRetriever:
             score_threshold=0.0,
         )
         if not retrieved:
+            self._remember_query(cache_key, None)
             return None
 
         best_by_intent: dict[str, tuple[float, str]] = {}
@@ -103,20 +151,36 @@ class IntentRAGRetriever:
             reverse=True,
         )
         if not ranked:
+            self._remember_query(cache_key, None)
             return None
 
         best_intent, (best_score, best_example) = ranked[0]
         runner_up_score = ranked[1][1][0] if len(ranked) > 1 else 0.0
         if best_score < self.score_threshold:
+            self._remember_query(cache_key, None)
             return None
         if best_score - runner_up_score < self.margin_threshold:
+            self._remember_query(cache_key, None)
             return None
-        return IntentMatch(
+        match = IntentMatch(
             intent=best_intent,
             score=best_score,
             example=best_example,
             runner_up_score=runner_up_score,
         )
+        self._remember_query(cache_key, match)
+        return match
+
+    def _remember_query(
+        self,
+        cache_key: str,
+        value: IntentMatch | None,
+    ) -> None:
+        if not cache_key:
+            return
+        self._query_cache[cache_key] = value
+        while len(self._query_cache) > self._query_cache_size:
+            self._query_cache.pop(next(iter(self._query_cache)))
 
     def _ensure_index(self) -> None:
         current_metadata = getattr(self.store.collection, "metadata", {}) or {}
@@ -139,15 +203,24 @@ class IntentRAGRetriever:
             )
             for index, example in enumerate(self.examples)
         ]
+        batch_size = int(self.embedding_settings.get("batch_size", 10))
+        embeddings: list[list[float]] = []
+        for start in range(0, len(self.examples), batch_size):
+            batch = self.examples[start : start + batch_size]
+            embeddings.extend(
+                self.embedding_client.embed_texts(
+                    [example.text for example in batch]
+                )
+            )
         self.store.save(
             chunks=chunks,
-            embeddings=[self._embed(example.text) for example in self.examples],
+            embeddings=embeddings,
             metadata={
                 "source_type": "intent_examples",
                 "document_path": self.document_path,
                 "intent_corpus_hash": self.corpus_hash,
                 "example_count": len(self.examples),
-                "embedding_dimension": self.embedding_dimension,
+                "embedding_model_name": self.embedding_model_name,
             },
         )
 
@@ -155,26 +228,8 @@ class IntentRAGRetriever:
         payload = "\n".join(
             f"{example.intent}:{example.text}" for example in examples
         )
+        payload = f"{self.embedding_model_name}\n{payload}"
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
-
-    def _embed(self, text: str) -> list[float]:
-        normalized = re.sub(r"[\s，。,.!?！？、:：;；]+", "", text.strip()).casefold()
-        if not normalized:
-            return []
-        vector = [0.0] * self.embedding_dimension
-        for size in (1, 2, 3):
-            if len(normalized) < size:
-                continue
-            for index in range(0, len(normalized) - size + 1):
-                token = normalized[index:index + size]
-                digest = hashlib.sha256(token.encode("utf-8")).digest()
-                bucket = int.from_bytes(digest[:4], "big") % self.embedding_dimension
-                sign = 1.0 if digest[4] % 2 == 0 else -1.0
-                vector[bucket] += sign
-        norm = math.sqrt(sum(value * value for value in vector))
-        if norm == 0:
-            return []
-        return [value / norm for value in vector]
 
     def _stable_id(self, text: str) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]

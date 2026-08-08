@@ -63,7 +63,11 @@ class RuleBasedNLU:
     def extract(self, request: ChatRequest) -> NLUResult:
         text = request.text or ""
         payload = request.payload or {}
-        intent = self._detect_intent(text, request.event, payload)
+        intent, intent_source, rag_match = self._detect_intent(
+            text,
+            request.event,
+            payload,
+        )
         slots = self._extract_slots(text, payload, request.event, intent)
         if (
             intent == "smalltalk"
@@ -78,7 +82,14 @@ class RuleBasedNLU:
 
         return NLUResult(
             intent=intent,
-            confidence=0.72 if intent != "smalltalk" else 0.45,
+            confidence=(
+                rag_match.score
+                if intent_source == "rag" and rag_match
+                else self._rule_confidence(text, intent, payload)
+            ),
+            intent_source=intent_source,
+            rag_score=rag_match.score if rag_match else None,
+            rag_example=rag_match.example if rag_match else None,
             slots=slots,
             is_modification=self._is_modification(text),
             reference_text=self._extract_reference(text, payload),
@@ -89,9 +100,31 @@ class RuleBasedNLU:
         text: str,
         event: str | None,
         payload: dict[str, Any],
-    ) -> str:
+    ) -> tuple[str, str, Any | None]:
+        event_intent = self._event_intent(event)
+        if event_intent:
+            return event_intent, "event", None
+
+        rule_intent = self._detect_rule_intent(text, event, payload)
+        if self._is_deterministic_rule(text, rule_intent, payload):
+            return rule_intent, "rule", None
+
+        intent_match = (
+            intent_rag_retriever.retrieve(text)
+            if self._should_use_intent_rag(text)
+            else None
+        )
+        selected_intent, source = self._resolve_intent_conflict(
+            text=text,
+            payload=payload,
+            rule_intent=rule_intent,
+            intent_match=intent_match,
+        )
+        return selected_intent, source, intent_match
+
+    def _event_intent(self, event: str | None) -> str | None:
         if event:
-            event_intent = {
+            return {
                 "select_movie": "select_or_modify",
                 "select_cinema": "select_or_modify",
                 "select_showtime": "select_showtime",
@@ -106,9 +139,14 @@ class RuleBasedNLU:
                 "refund_order": "refund_order",
                 "get_refund_status": "refund_status_query",
             }.get(event)
-            if event_intent:
-                return event_intent
+        return None
 
+    def _detect_rule_intent(
+        self,
+        text: str,
+        event: str | None,
+        payload: dict[str, Any],
+    ) -> str:
         lowered = text.lower()
         if is_greeting_text(text):
             return "smalltalk"
@@ -173,13 +211,6 @@ class RuleBasedNLU:
             if _contains_catalog_term(text, "booking_with_seat"):
                 return "book_ticket"
             return "seat_query"
-        intent_match = (
-            intent_rag_retriever.retrieve(text)
-            if self._should_use_intent_rag(text)
-            else None
-        )
-        if intent_match:
-            return intent_match.intent
         if self._is_movie_browsing(text):
             return "search_movies"
         if self._has_booking_slot_text(text):
@@ -197,6 +228,82 @@ class RuleBasedNLU:
         if "rag" in lowered:
             return "faq"
         return "smalltalk"
+
+    def _is_deterministic_rule(
+        self,
+        text: str,
+        rule_intent: str,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Protect operations where a semantic guess must never change behavior."""
+        if rule_intent in {
+            "cancel",
+            "skip_snacks",
+            "skip_coupon",
+            "order_query",
+            "refund_order",
+            "refund_status_query",
+            "faq",
+            "location_query",
+            "nearby_cinema",
+            "seat_query",
+            "price_query",
+            "pay_order",
+            "confirm_order",
+            "coupon",
+        }:
+            return True
+        if self._has_explicit_booking_cue(text) and (
+            self._extract_movie_name(text)
+            or self._extract_genre(text)
+            or self._extract_date(text)
+            or self._extract_time(text)
+        ):
+            return rule_intent == "book_ticket"
+        return False
+
+    def _resolve_intent_conflict(
+        self,
+        text: str,
+        payload: dict[str, Any],
+        rule_intent: str,
+        intent_match: Any | None,
+    ) -> tuple[str, str]:
+        if not intent_match:
+            return rule_intent, "rule"
+
+        if intent_match.intent == rule_intent:
+            return rule_intent, "hybrid"
+
+        rule_score = self._rule_confidence(text, rule_intent, payload)
+        rag_score = float(intent_match.score)
+
+        # RAG may correct generic fallbacks, but not a strong explicit rule.
+        if rule_score < 0.75 and rag_score >= 0.42:
+            return intent_match.intent, "rag"
+        if rag_score - rule_score >= 0.12:
+            return intent_match.intent, "rag"
+        return rule_intent, "rule"
+
+    def _rule_confidence(
+        self,
+        text: str,
+        intent: str,
+        payload: dict[str, Any] | None = None,
+    ) -> float:
+        payload = payload or {}
+        if intent == "smalltalk":
+            return 0.35 if text.strip() else 0.0
+        if intent in {"search_movies", "book_ticket"}:
+            if payload or self._has_booking_slot_text(text):
+                return 0.88
+            if self._is_movie_recommendation_text(text) or self._is_movie_keyword_query(text):
+                return 0.92
+            if self._is_movie_search_text(text) or self._is_showtime_query_text(text):
+                return 0.86
+        if intent in {"snack", "select_or_modify"}:
+            return 0.84
+        return 0.78
 
     def _extract_slots(
         self,
@@ -250,6 +357,9 @@ class RuleBasedNLU:
         recommendation_criteria = self._extract_movie_recommendation_criteria(text)
         if recommendation_criteria and not self._has_explicit_booking_cue(text):
             slots["recommendationCriteria"] = recommendation_criteria
+            movie_limit = self._extract_movie_recommendation_limit(text)
+            if movie_limit:
+                slots["movieLimit"] = movie_limit
             self._add_clear_slots(
                 slots,
                 "movieId",
@@ -268,6 +378,7 @@ class RuleBasedNLU:
                 "amount",
                 "status",
                 "expiresAt",
+                "movieLimit",
             )
 
         movie_name = payload.get("movieName") or payload.get("movie_name")
@@ -320,6 +431,7 @@ class RuleBasedNLU:
             "endAt",
             "seatPositions",
             "ticketCount",
+            "movieLimit",
         ]:
             if key in payload:
                 slots[key] = payload[key]
@@ -519,6 +631,8 @@ class RuleBasedNLU:
             return "today"
         if _contains_catalog_term(text, "date_tomorrow"):
             return "tomorrow"
+        if _contains_catalog_term(text, "date_after_tomorrow"):
+            return "after_tomorrow"
         if _contains_catalog_term(text, "date_weekend"):
             return "weekend"
 
@@ -865,6 +979,26 @@ class RuleBasedNLU:
             return "general"
         return None
 
+    def _extract_movie_recommendation_limit(self, text: str) -> int | None:
+        normalized = _normalize_short_text(text)
+        if not normalized:
+            return None
+        match = re.search(
+            r"(?:推荐|找|挑|选|看看|来|给我|帮我)?"
+            r"(?P<count>\d+|[一二两三四五六七八九十俩两几])"
+            r"(?:个|部|部片|部电影|个电影|个影片)",
+            normalized,
+        )
+        if not match:
+            return None
+        raw_count = match.group("count")
+        if raw_count == "几":
+            return 3
+        count = int(raw_count) if raw_count.isdigit() else self._parse_chinese_number(raw_count)
+        if count is None:
+            return None
+        return max(1, min(count, 5))
+
     def _should_use_intent_rag(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
         if not normalized:
@@ -892,6 +1026,8 @@ class RuleBasedNLU:
     def _extract_movie_search_keyword(self, text: str) -> str | None:
         normalized = _normalize_short_text(text)
         if not normalized:
+            return None
+        if self._extract_movie_recommendation_criteria(text):
             return None
         if _contains_catalog_term(normalized, "movie_keyword_excluded"):
             return None

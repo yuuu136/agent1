@@ -24,7 +24,9 @@ intent_rag:
   top_k: 8
   score_threshold: 0.42
   margin_threshold: 0.04
-  embedding_dimension: 512
+  # Uses the shared semantic Embedding configuration above by default.
+  # Add an `embedding:` block here only when intent retrieval needs a
+  # different provider or model from knowledge-document RAG.
 
 retrieval_policy:
   use_rag_for:
