@@ -9,6 +9,13 @@ from app.schemas.agent import AgentPlan, AgentState, NLUResult
 class TaskPlanner:
     def plan(self, state: AgentState, nlu: NLUResult) -> AgentPlan:
         slots = {**state.slots, **nlu.slots}
+        order_context = state.selected.get("order")
+        if (
+            isinstance(order_context, dict)
+            and order_context.get("orderId") not in [None, ""]
+            and slots.get("orderId") in [None, ""]
+        ):
+            slots["orderId"] = order_context.get("orderId")
 
         # ── Low confidence: let LLM handle freely ──
         if nlu.intent_source == "llm" and nlu.confidence < 0.55:
@@ -89,6 +96,50 @@ class TaskPlanner:
                 state="selecting_snacks",
             )
 
+        if nlu.intent == "select_snacks":
+            snack_params = self._pick(
+                slots,
+                [
+                    "orderId",
+                    "snackIds",
+                    "snackId",
+                    "snackItems",
+                    "snackRequests",
+                    "quantity",
+                    "ticketCount",
+                    "cinemaId",
+                    "cinemaName",
+                ],
+            )
+            snack_id = snack_params.pop("snackId", None)
+            quantity = snack_params.pop("quantity", None)
+            if not snack_params.get("snackIds") and snack_id not in [None, ""]:
+                snack_params["snackIds"] = [snack_id]
+            if (
+                snack_params.get("snackIds")
+                and not snack_params.get("snackItems")
+                and quantity not in [None, ""]
+            ):
+                snack_params["snackItems"] = [
+                    {
+                        "snackId": snack_params["snackIds"][0],
+                        "quantity": quantity,
+                    }
+                ]
+            if snack_params.get("snackIds") or snack_params.get("snackItems"):
+                return AgentPlan(
+                    action="confirm_selection",
+                    reason="用户选择零食",
+                    params=snack_params,
+                    state="selecting_snacks",
+                )
+            return AgentPlan(
+                action="recommend_snacks",
+                reason="继续选择零食",
+                params=snack_params,
+                state="selecting_snacks",
+            )
+
         if nlu.intent == "order_query":
             if slots.get("orderId") and "我的订单" not in nlu.reference_text:
                 return AgentPlan(action="get_order", params=self._pick(slots, ["orderId"]), state="answering")
@@ -133,15 +184,86 @@ class TaskPlanner:
                     state="selecting_seats")
             return AgentPlan(action="confirm_selection", params=slots, state="confirming")
 
+        if slots.get("changeShowtime"):
+            showtime_params = self._pick(
+                slots,
+                [
+                    "movieName",
+                    "genre",
+                    "date",
+                    "timeRange",
+                    "ticketCount",
+                    "cinemaId",
+                    "cinemaName",
+                    "hallType",
+                    "pricePreference",
+                    "timePreference",
+                    "seatPositions",
+                    "excludeShowtimeId",
+                ],
+            )
+            if slots.get("orderId") or state.selected.get("order"):
+                return AgentPlan(
+                    action="cancel_order",
+                    reason="先释放旧的锁座订单再换场",
+                    params={
+                        "orderId": slots.get("orderId"),
+                        "resumeAction": "search_showtimes",
+                        "resumeParams": showtime_params,
+                    },
+                    state="selecting_showtime",
+                )
+            return AgentPlan(
+                action="search_showtimes",
+                params=showtime_params,
+                state="selecting_showtime",
+            )
+
         if nlu.intent in ("select_showtime", "seat_query") or (
             slots.get("showtimeId") and "showtimeId" in nlu.slots
         ):
             # User wants to (re)select seats. Cancel any pending order first.
             if (slots.get("orderId") or state.selected.get("order")):
+                seat_params = self._pick(
+                    slots,
+                    [
+                        "showtimeId",
+                        "ticketCount",
+                        "seatPreference",
+                        "seatPositions",
+                    ],
+                )
                 return AgentPlan(
                     action="cancel_order",
                     reason="先释放旧的锁座订单再重选",
-                    params=self._pick(slots, ["orderId"]),
+                    params={
+                        "orderId": slots.get("orderId"),
+                        "resumeAction": (
+                            "get_seats"
+                            if seat_params.get("showtimeId")
+                            else "search_showtimes"
+                        ),
+                        "resumeParams": (
+                            seat_params
+                            if seat_params.get("showtimeId")
+                            else self._pick(
+                                slots,
+                                [
+                                    "movieId",
+                                    "movieName",
+                                    "genre",
+                                    "date",
+                                    "timeRange",
+                                    "ticketCount",
+                                    "cinemaId",
+                                    "cinemaName",
+                                    "hallType",
+                                    "pricePreference",
+                                    "timePreference",
+                                ],
+                            )
+                        ),
+                    },
                     state="selecting_seats",
                 )
             if not slots.get("showtimeId"):
@@ -165,14 +287,11 @@ class TaskPlanner:
                 params=self._pick(slots, ["location", "city", "movieName", "genre"]),
                 state="selecting_cinema")
 
-        if slots.get("changeShowtime"):
-            return AgentPlan(action="search_showtimes",
-                params=self._pick(slots, ["movieName", "genre", "date", "timeRange",
-                    "ticketCount", "cinemaId", "cinemaName", "hallType",
-                    "pricePreference", "timePreference", "seatPositions"]),
-                state="selecting_showtime")
-
-        if slots.get("showtimeId"):
+        if (
+            slots.get("showtimeId")
+            and state.pending_action == "get_seats"
+            and state.state == "selecting_seats"
+        ):
             return AgentPlan(action="get_seats",
                 params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference", "seatPositions"]),
                 state="selecting_seats")
@@ -192,14 +311,50 @@ class TaskPlanner:
         # movie actually has showtimes. LLM chat may have mentioned films
         # that aren't in our database.
         movie_name = slots.get("movieName")
-        if tr.flow == "book_ticket" and movie_name \
-                and not self._movie_is_verified(movie_name, state):
+        if tr.flow == "book_ticket" and movie_name and not self._movie_is_verified(
+            movie_name,
+            state,
+        ):
+            if slots.get("seatPositions"):
+                return AgentPlan(
+                    action="search_showtimes",
+                    reason="用户已给出具体座位，直接查场次并尝试锁座",
+                    params=self._pick(
+                        slots,
+                        [
+                            "movieName",
+                            "movieId",
+                            "date",
+                            "timeRange",
+                            "ticketCount",
+                            "cinemaId",
+                            "cinemaName",
+                            "hallType",
+                            "notHallType",
+                            "maxPrice",
+                            "seatPositions",
+                            "excludeShowtimeId",
+                        ],
+                    ),
+                    state="selecting_showtime",
+                )
             return AgentPlan(
                 action="search_movies",
-                reason=f"先验证《{movie_name}》是否有场次",
-                params=self._pick(slots, ["movieName", "genre", "date",
-                    "cinemaId", "cinemaName", "hallType", "notHallType",
-                    "maxPrice", "recommendationCriteria"]),
+                reason="先验证电影是否有场次",
+                params=self._pick(
+                    slots,
+                    [
+                        "movieName",
+                        "genre",
+                        "date",
+                        "cinemaId",
+                        "cinemaName",
+                        "hallType",
+                        "notHallType",
+                        "maxPrice",
+                        "recommendationCriteria",
+                    ],
+                ),
                 state="selecting_movie",
             )
 

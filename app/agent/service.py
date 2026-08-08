@@ -437,15 +437,19 @@ class AgentService:
             state.slots.pop("seatIds", None)
             state.slots.pop("snackIds", None)
             state.slots.pop("snackItems", None)
+            state.slots.pop("snackRequests", None)
             state.selected.pop("order", None)
             state.selected.pop("seat_map", None)
             state.selected.pop("snack_candidates", None)
             state.pending_action = None
             result.data["seatsReleased"] = True
+            self._resume_after_cancel_order(state, plan, result)
             return
 
         if plan.action == "confirm_selection" and plan.params.get("skipSnacks"):
             state.slots.pop("snackIds", None)
+            state.slots.pop("snackItems", None)
+            state.slots.pop("snackRequests", None)
             state.selected.pop("snack_candidates", None)
             state.pending_action = None
             result.data = {"skipped": "snacks"}
@@ -479,6 +483,7 @@ class AgentService:
             )
             if not result.success:
                 return
+            state.slots.pop("snackRequests", None)
             result.message = "零食已加入订单，可以继续支付。"
             if applied and result.data.get("totalAmount") not in [None, ""]:
                 result.message = (
@@ -617,6 +622,68 @@ class AgentService:
                 "ticketStatus",
                 "issued",
             )
+
+    def _resume_after_cancel_order(
+        self,
+        state: AgentState,
+        plan: AgentPlan,
+        result: ToolResult,
+    ) -> None:
+        """Continue a seat/showtime replacement after the old seat lock is released."""
+        action = plan.params.get("resumeAction")
+        params = plan.params.get("resumeParams")
+        if action not in {"get_seats", "search_showtimes"} or not isinstance(
+            params,
+            dict,
+        ):
+            return
+
+        resume_params = dict(params)
+        jwt = plan.params.get("jwt")
+        if jwt:
+            resume_params["jwt"] = jwt
+
+        resume_plan = AgentPlan(
+            action=action,
+            reason=plan.reason,
+            params=resume_params,
+            state=(
+                "selecting_seats"
+                if action == "get_seats"
+                else "selecting_showtime"
+            ),
+        )
+        resume_result = agent_toolbox.execute(resume_plan, state)
+        self._apply_tool_result(state, resume_plan, resume_result)
+
+        if resume_result.success:
+            prefix = "已释放原座位，"
+            if action == "get_seats":
+                resume_result.message = (
+                    f"{prefix}{resume_result.message}"
+                    if resume_result.message
+                    else "已释放原座位，请重新选择座位。"
+                )
+            else:
+                resume_result.message = (
+                    f"{prefix}{resume_result.message}"
+                    if resume_result.message
+                    else "已释放原座位，以下是可选场次。"
+                )
+            resume_result.data["seatsReleased"] = True
+
+        # The response must describe the resumed action, otherwise CardBuilder
+        # would see cancel_order and omit the returned seat map/showtime cards.
+        plan.action = resume_plan.action
+        plan.reason = resume_plan.reason
+        plan.params = resume_plan.params
+        plan.state = resume_plan.state
+        result.tool_name = resume_result.tool_name
+        result.success = resume_result.success
+        result.data = resume_result.data
+        result.message = resume_result.message
+        result.cards = resume_result.cards
+        result.suggestions = resume_result.suggestions
 
     def _auto_lock_explicit_seats(
         self,
@@ -811,6 +878,10 @@ class AgentService:
             lock_result.data,
             jwt=jwt,
         ):
+            result.data["paymentReady"] = True
+            return
+
+        if state.slots.get("seatPositions") and not state.slots.get("snackRequests"):
             result.data["paymentReady"] = True
             return
 
@@ -1049,6 +1120,7 @@ class AgentService:
         if not applied:
             return False
 
+        state.slots.pop("snackRequests", None)
         state.state = "paying"
         state.pending_action = "pay_order"
         result.data["order"] = state.selected.get("order", order_data.copy())

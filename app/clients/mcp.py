@@ -257,6 +257,7 @@ class SpringBootMovieTicketMCP:
             arguments.get("ticketCount"),
             arguments.get("pricePreference"),
             arguments.get("timePreference"),
+            arguments.get("excludeShowtimeId"),
         )
         response_data: dict[str, Any] = {
             "showtimes": showtimes,
@@ -1554,12 +1555,17 @@ class SpringBootMovieTicketMCP:
         ticket_count: Any,
         price_preference: Any = None,
         time_preference: Any = None,
+        exclude_showtime_id: Any = None,
     ) -> list[dict[str, Any]]:
         requested_time = str(time_range or "")
         min_seats = int(ticket_count or 0)
+        excluded_showtime_id = str(exclude_showtime_id or "").strip()
         filtered = []
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
         for showtime in showtimes:
+            showtime_id = str(showtime.get("showtimeId") or "").strip()
+            if excluded_showtime_id and showtime_id == excluded_showtime_id:
+                continue
             start_at = self._parse_showtime_datetime(showtime.get("startAt"))
             if start_at is not None and start_at <= now:
                 continue

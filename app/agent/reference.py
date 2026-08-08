@@ -59,6 +59,8 @@ class ReferenceResolver:
                     "lockId",
                     "couponId",
                     "snackIds",
+                    "snackItems",
+                    "snackRequests",
                     "price",
                 )
             if "还是老位置" in text:
@@ -81,6 +83,8 @@ class ReferenceResolver:
 
         if self._is_change_showtime(text):
             slots["changeShowtime"] = True
+            if state.slots.get("showtimeId") not in [None, ""]:
+                slots["excludeShowtimeId"] = state.slots.get("showtimeId")
             self._clear_downstream_selection(slots)
 
         if nlu.intent == "seat_query" and (
@@ -96,6 +100,8 @@ class ReferenceResolver:
                 "lockId",
                 "couponId",
                 "snackIds",
+                "snackItems",
+                "snackRequests",
                 "price",
             )
 
@@ -141,6 +147,8 @@ class ReferenceResolver:
             "lockId",
             "couponId",
             "snackIds",
+            "snackItems",
+            "snackRequests",
             "price",
             "amount",
             "status",
@@ -481,6 +489,8 @@ class ReferenceResolver:
                 "lockId",
                 "couponId",
                 "snackIds",
+                "snackItems",
+                "snackRequests",
                 "price",
             )
         elif slot_key == "cinemaId":
@@ -493,6 +503,8 @@ class ReferenceResolver:
                 "lockId",
                 "couponId",
                 "snackIds",
+                "snackItems",
+                "snackRequests",
                 "price",
             )
         elif slot_key == "showtimeId":
@@ -504,6 +516,8 @@ class ReferenceResolver:
                 "lockId",
                 "couponId",
                 "snackIds",
+                "snackItems",
+                "snackRequests",
                 "price",
             )
 

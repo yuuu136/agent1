@@ -103,6 +103,27 @@ class LLMNLU:
                 return NLUResult(intent="smalltalk", confidence=0.85, intent_source="rule")
             if is_cancel_text(text):
                 return NLUResult(intent="cancel", confidence=0.95, intent_source="rule")
+            if self._is_price_query_text(text):
+                return NLUResult(intent="price_query", confidence=0.95, intent_source="rule")
+            if self._is_nearby_cinema_text(text):
+                slots = dict(payload.get("slots", {}) or {})
+                if payload.get("location") not in [None, ""]:
+                    slots["location"] = payload.get("location")
+                if payload.get("city") not in [None, ""]:
+                    slots["city"] = payload.get("city")
+                return NLUResult(
+                    intent="nearby_cinema",
+                    confidence=0.95,
+                    intent_source="rule",
+                    slots=slots,
+                )
+            if self._is_booking_request_text(text):
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.92,
+                    intent_source="rule",
+                    slots=dict(payload.get("slots", {}) or {}),
+                )
 
         # ── payload-driven intents: event-based ──
         if request.event:
@@ -254,6 +275,20 @@ class LLMNLU:
             if date_value in ("后天",):        date_value = "after_tomorrow"
             llm_slots["date"] = date_value
 
+        seat_positions = self._extract_seat_positions(text)
+        if seat_positions:
+            llm_slots["seatPositions"] = seat_positions
+            if intent in {"smalltalk", "search_movies"}:
+                intent = "book_ticket"
+                confidence = max(confidence, 0.95)
+
+        multi_movie_names = self._extract_multi_movie_names(text)
+        if len(multi_movie_names) > 1:
+            llm_slots["movieNames"] = multi_movie_names
+            if intent in {"smalltalk", "search_movies", "book_ticket"}:
+                intent = "multi_movie_booking"
+                confidence = max(confidence, 0.92)
+
         return NLUResult(
             intent=intent,
             confidence=confidence,
@@ -261,6 +296,120 @@ class LLMNLU:
             slots=llm_slots,
             is_modification=bool(parsed.get("is_modification")),
             reference_text=str(parsed.get("reference") or text),
+        )
+
+    def _extract_seat_positions(self, text: str) -> list[dict[str, int]]:
+        normalized = re.sub(r"\s+", "", text)
+        pattern = re.compile(
+            r"(?P<row>[0-9一二三四五六七八九十两]+)排"
+            r"(?P<seat>[0-9一二三四五六七八九十两]+)"
+            r"(?:座|号|位)?"
+        )
+        positions: list[dict[str, int]] = []
+        for match in pattern.finditer(normalized):
+            row_no = self._parse_number_token(match.group("row"))
+            seat_no = self._parse_number_token(match.group("seat"))
+            if row_no is None or seat_no is None:
+                continue
+            position = {"rowNo": row_no, "seatNo": seat_no}
+            if position not in positions:
+                positions.append(position)
+        return positions
+
+    def _extract_multi_movie_names(self, text: str) -> list[str]:
+        normalized = re.sub(r"\s+", "", text)
+        if not any(marker in normalized for marker in ["买", "订", "要", "票", "影票", "电影票"]):
+            return []
+        if not any(marker in normalized for marker in ["和", "及", "以及", "还有", "、"]):
+            return []
+
+        segments = re.split(r"和|及|以及|还有|、", normalized)
+        names: list[str] = []
+        for segment in segments:
+            cleaned = self._strip_movie_segment(segment)
+            if cleaned:
+                names.append(cleaned)
+
+        deduped: list[str] = []
+        for name in names:
+            if name not in deduped:
+                deduped.append(name)
+        return deduped
+
+    def _strip_movie_segment(self, segment: str) -> str:
+        cleaned = str(segment or "")
+        cleaned = re.sub(
+            r"^(给我|帮我|我要|我想|想要|买|订|预订|来|一张|两张|三张|四张|五张|六张|七张|八张|九张|十张|今天|明天|今晚|明晚|后天|上午|下午|晚上|的)+",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"(电影票|影票|电影|票|的)+$", "", cleaned)
+        cleaned = cleaned.strip("《》<>【】[]()，,。.!?：:")
+        return cleaned
+
+    def _parse_number_token(self, value: str) -> int | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+
+        digits = {
+            "零": 0,
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+        }
+        if text in digits:
+            return digits[text]
+        if len(text) == 2 and text[0] == "十" and text[1] in digits:
+            return 10 + digits[text[1]]
+        if len(text) == 2 and text[1] == "十" and text[0] in digits:
+            return digits[text[0]] * 10
+        if len(text) == 3 and text[1] == "十" and text[0] in digits and text[2] in digits:
+            return digits[text[0]] * 10 + digits[text[2]]
+        return None
+
+    def _is_price_query_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        return any(
+            phrase in normalized
+            for phrase in ["多少钱", "什么价位", "票价", "价格", "多少钱一张", "多少钱啊"]
+        )
+
+    def _is_nearby_cinema_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        return any(
+            phrase in normalized
+            for phrase in ["附近有什么影院", "附近影院", "周边影院", "附近影城", "nearbycinema", "附近有啥影院"]
+        )
+
+    def _is_booking_request_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        return any(
+            phrase in normalized
+            for phrase in [
+                "bookmovietickets",
+                "bookticket",
+                "buyticket",
+                "订票",
+                "买票",
+                "买电影票",
+                "帮我订",
+                "帮我买",
+                "给我买",
+                "给我订",
+                "我要订票",
+                "我要买票",
+            ]
         )
 
     @staticmethod
