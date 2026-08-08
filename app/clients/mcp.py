@@ -128,6 +128,7 @@ class SpringBootMovieTicketMCP:
                     has_showtimes=True,
                     genre=arguments.get("genre"),
                     keyword=keyword,
+                    date=arguments.get("date"),
                 ),
             )
 
@@ -139,7 +140,7 @@ class SpringBootMovieTicketMCP:
                 "size": arguments.get("size", 10),
                 "keyword": keyword,
                 "genre": arguments.get("genre"),
-                "status": arguments.get("status"),
+                "date": self._spring_date(arguments.get("date")),
             },
         )
         records = data.get("records") or []
@@ -157,6 +158,7 @@ class SpringBootMovieTicketMCP:
                 recommendation_criteria,
                 genre=arguments.get("genre"),
                 keyword=keyword,
+                date=arguments.get("date"),
             ),
         )
 
@@ -1009,13 +1011,17 @@ class SpringBootMovieTicketMCP:
         has_showtimes: bool = False,
         genre: Any = None,
         keyword: Any = None,
+        date: Any = None,
     ) -> str:
         count = len(movies)
         genre_label = str(genre or "").strip()
         keyword_label = str(keyword or "").strip()
+        date_label = self._display_date(date) if date else ""
 
         if count == 0:
             if genre_label:
+                if date_label:
+                    return f"{date_label}没有{genre_label}类型的排片。要不要换个类型或日期看看？"
                 return f"{genre_label}类型的影片暂时没有排片。要不要看看现在有哪些电影正在上映？"
             if keyword_label:
                 return f"没有找到与「{keyword_label}」相关的影片，换个关键词试试？"
@@ -1023,7 +1029,7 @@ class SpringBootMovieTicketMCP:
                 return f"{cinema_name}暂时没有正在上映的影片，看看其他影院？"
             return "当前没有正在上映的影片。过几天再来看看吧。"
 
-        head = self._movie_search_head(count, genre_label, keyword_label, criteria, cinema_name, has_showtimes)
+        head = self._movie_search_head(count, genre_label, keyword_label, criteria, cinema_name, has_showtimes, date_label)
         detail = self._movie_showtime_lines(movies)
         if detail:
             return f"{head}\n\n{detail}"
@@ -1037,11 +1043,13 @@ class SpringBootMovieTicketMCP:
         criteria: Any,
         cinema_name: str | None,
         has_showtimes: bool,
+        date_label: str = "",
     ) -> str:
+        date_prefix = f"{date_label}" if date_label else ""
         if genre_label:
-            return f"为你找到了 {count} 部{genre_label}片"
+            return f"为你找到了 {count} 部{date_prefix}{genre_label}片"
         if keyword_label:
-            return f"为你找到了 {count} 部与「{keyword_label}」相关的影片"
+            return f"为你找到了 {count} 部与「{keyword_label}」相关的{date_prefix}影片"
         labels = {
             "couple": "适合情侣一起观看的",
             "family": "适合亲子或家庭的",
@@ -1052,10 +1060,12 @@ class SpringBootMovieTicketMCP:
         }
         label = labels.get(str(criteria or "").strip())
         if label:
-            return f"为你找到了 {count} 部{label}影片"
+            return f"为你找到了 {count} 部{label}{date_prefix}影片"
         if cinema_name:
             action = "正在排片" if has_showtimes else "正在上映"
-            return f"{cinema_name}有 {count} 部电影{action}"
+            return f"{cinema_name}有 {count} 部电影{date_prefix}{action}"
+        if date_label:
+            return f"{date_prefix}有 {count} 部电影正在上映"
         return f"当前有 {count} 部电影正在上映"
 
     @staticmethod
