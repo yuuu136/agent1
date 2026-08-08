@@ -27,6 +27,15 @@ class ReferenceResolver:
         slots = dict(nlu.slots)
         text = nlu.reference_text or state.last_user_text
 
+        # LLM 已经利用上下文解析出了完整 slot，不再用硬编码覆盖
+        if nlu.intent_source == "llm" and (
+            slots.get("cinemaName")
+            or slots.get("movieName")
+            or slots.get("movieId")
+            or slots.get("showtimeId")
+        ):
+            return nlu.model_copy(update={"slots": slots})
+
         if nlu.is_modification:
             if "便宜" in text:
                 slots["pricePreference"] = "lower"

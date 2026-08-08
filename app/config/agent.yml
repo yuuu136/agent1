@@ -32,9 +32,16 @@ llm:
   api_key_env: DASHSCOPE_API_KEY
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   chat_model_name: qwen-max
-  temperature: 0.3
+  temperature: 0.5
   max_tokens: 1200
   timeout_seconds: 60
+
+nlu:
+  provider: qwen-turbo
+  model: qwen-turbo
+  temperature: 0.5
+  max_tokens: 400
+  timeout_seconds: 15
 
 agent:
   default_state: idle

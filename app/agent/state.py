@@ -86,13 +86,18 @@ class InMemorySessionStore:
         self._states[state.session_id] = state.model_copy(deep=True)
 
 
-def merge_slots(current_slots: dict[str, Any], new_slots: dict[str, Any]) -> dict[str, Any]:
+def merge_slots(current_slots: dict[str, Any], new_slots: dict[str, Any],
+                 new_intent: str = "") -> dict[str, Any]:
     merged = deepcopy(current_slots)
+
+    # Honour explicit clearing
     clear_slots = new_slots.get("__clearSlots") or []
     if isinstance(clear_slots, list):
         for key in clear_slots:
             if isinstance(key, str):
                 merged.pop(key, None)
+
+    # Accumulate new values
     for key, value in new_slots.items():
         if key == "__clearSlots":
             continue
@@ -100,15 +105,19 @@ def merge_slots(current_slots: dict[str, Any], new_slots: dict[str, Any]) -> dic
             continue
         if isinstance(value, str) and not value.strip():
             continue
+        if isinstance(value, list) and not value:
+            continue
         merged[key] = value
+
+    # Basic sanity: movieName shouldn't be a genre keyword or hall type
     movie_name = str(merged.get("movieName") or "").strip()
     if movie_name in INVALID_MOVIE_NAME_VALUES or _is_invalid_movie_name(movie_name):
         merged.pop("movieName", None)
-        movie_name = ""
-    if "genre" in new_slots and movie_name in GENRE_VALUES:
+    elif "genre" in new_slots and movie_name in GENRE_VALUES:
         merged.pop("movieName", None)
-    if "hallType" in new_slots and movie_name.upper() in HALL_TYPE_VALUES:
+    elif "hallType" in new_slots and movie_name.upper() in HALL_TYPE_VALUES:
         merged.pop("movieName", None)
+
     return merged
 
 

@@ -1,4 +1,10 @@
 prompts:
+
+  nlu:
+    path: prompts/agent/nlu.md
+    description: NLU 意图识别与槽位提取（LLM 主干）
+    required_variables: []
+
   system:
     path: prompts/agent/system.md
     description: 系统角色与行为边界

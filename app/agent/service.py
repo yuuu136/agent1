@@ -173,8 +173,8 @@ class AgentService:
                 node_update = {"response": response}
             yield node_name, node_update
 
-    def extract_nlu(self, request: ChatRequest) -> NLUResult:
-        return nlu_engine.extract(request)
+    def extract_nlu(self, request: ChatRequest, state: AgentState | None = None) -> NLUResult:
+        return nlu_engine.extract(request, state)
 
     def _graph_config(self, session_id: str) -> dict[str, Any]:
         return {"configurable": {"thread_id": session_id}}
@@ -338,6 +338,8 @@ class AgentService:
                 "我帮你一步步找到最合适的那一场～"
             )
 
+        state.last_bot_message = message.strip()
+
         return AgentResponse(
             message=message.strip(),
             state="greeting",
@@ -367,7 +369,7 @@ class AgentService:
         return state.model_copy(
             update={
                 "intent": nlu.intent,
-                "slots": merge_slots(state.slots, nlu.slots),
+                "slots": merge_slots(state.slots, nlu.slots, nlu.intent),
             },
             deep=True,
         )
@@ -392,6 +394,7 @@ class AgentService:
         cards = card_builder.build(plan, result)
         message = result.message or self._default_message(plan, result)
         suggestions = result.suggestions or self._suggestions(plan, state)
+        state.last_bot_message = message
 
         return AgentResponse(
             message=message,
@@ -425,6 +428,20 @@ class AgentService:
                 "seatPreference": settings.get("default_seat_preference", "middle"),
             }
             result.message = "已取消当前购票流程。"
+            return
+
+        if plan.action == "cancel_order" and result.success:
+            # Partial cleanup: release locked seats but keep booking context.
+            state.slots.pop("orderId", None)
+            state.slots.pop("lockId", None)
+            state.slots.pop("seatIds", None)
+            state.slots.pop("snackIds", None)
+            state.slots.pop("snackItems", None)
+            state.selected.pop("order", None)
+            state.selected.pop("seat_map", None)
+            state.selected.pop("snack_candidates", None)
+            state.pending_action = None
+            result.data["seatsReleased"] = True
             return
 
         if plan.action == "confirm_selection" and plan.params.get("skipSnacks"):
@@ -473,6 +490,28 @@ class AgentService:
 
         if plan.action == "search_movies":
             state.selected.pop("movie_candidates", None)
+            # When search returns results with showtimes AND the user is asking
+            # about a specific movie (not browsing), auto-fill date+time so
+            # the user sees actual showtimes instead of being asked step by step.
+            movies = data.get("movies") or []
+            if isinstance(movies, list) and movies:
+                want_specific = plan.params.get("movieName") or plan.params.get("keyword")
+                if want_specific or plan.params.get("movieLimit") == 1:
+                    for movie in movies:
+                        showtimes = movie.get("upcomingShowtimes") or []
+                        if showtimes:
+                            dates = sorted({
+                                str(st.get("startAt", ""))[:10]
+                                for st in showtimes if st.get("startAt")
+                            })
+                            if dates:
+                                data["date"] = dates[0]
+                                # Pre-fill so DST doesn't re-ask date/time.
+                                # User picks from the actual showtime cards.
+                                data["timePreference"] = "any"
+                            if not data.get("movieName"):
+                                data["movieName"] = movie.get("movieName")
+                            break
         if plan.action == "search_showtimes":
             state.selected.pop("showtime_candidates", None)
             state.selected.pop("order", None)

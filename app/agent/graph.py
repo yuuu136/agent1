@@ -31,15 +31,13 @@ class AgentGraphState(TypedDict, total=False):
 
 
 ASK_ACTIONS = {
-    "ask_movie_or_genre",
-    "ask_time",
-    "ask_ticket_count",
+    "ask",
     "smalltalk",
 }
 
 
 def nlu_node(data: AgentGraphState) -> dict[str, Any]:
-    return {"nlu": nlu_engine.extract(data["request"])}
+    return {"nlu": nlu_engine.extract(data["request"], data.get("state"))}
 
 
 def merge_context_node(data: AgentGraphState) -> dict[str, Any]:
@@ -49,7 +47,7 @@ def merge_context_node(data: AgentGraphState) -> dict[str, Any]:
         "state": state.model_copy(
             update={
                 "intent": nlu.intent,
-                "slots": merge_slots(state.slots, nlu.slots),
+                "slots": merge_slots(state.slots, nlu.slots, nlu.intent),
             },
             deep=True,
         )
@@ -76,6 +74,7 @@ def planner_node(data: AgentGraphState) -> dict[str, Any]:
         "create_order",
         "pay_order",
         "issue_ticket",
+        "cancel_order",
         "refund_order",
         "get_refund_status",
         "get_order",
@@ -93,29 +92,77 @@ def route_after_planner(data: AgentGraphState) -> str:
 
 def ask_node(data: AgentGraphState) -> dict[str, Any]:
     state = data["state"]
-    messages = {
-        "ask_movie_or_genre": "想看哪部电影，或者想看什么类型？",
-        "ask_time": "想看什么时候的场次？比如今晚、明天下午，或者周末都行～",
-        "ask_ticket_count": "好的，想买几张票呢？",
-        "smalltalk": (
-            "嗨～ 有什么想看的吗？\n\n"
-            "你可以告诉我喜欢的类型，比如喜剧、动作、科幻，我帮你看看最近有什么好片。"
-            "如果心里已经有想看的电影了，直接说片名就行，我来帮你查场次和座位。"
-            "还没想好的话也没关系，带你逛逛最近热映的也不错～"
-        ),
-    }
-    action = data["plan"].action
-    message = messages.get(action, "还需要确认一下信息。")
-    if action == "ask_movie_or_genre" and state.slots.get("cinemaName"):
-        message = f"已选择{state.slots['cinemaName']}，想看哪部电影，或者想看什么类型？"
-    if action == "ask_time" and state.slots.get("movieName"):
-        message = f"好的，《{state.slots['movieName']}》～ 想看什么时候的？比如今晚、明天下午，也可以说周末～"
+    plan = data["plan"]
+    action = plan.action
+
+    # Generate a contextual ask message
+    message = _build_ask_message(state, plan)
+
+    # Context-aware smalltalk: user says "好的"/"行" while waiting for input
+    if action == "smalltalk" and state.pending_action:
+        ack_messages = {
+            "ask_time": "那我们就看最近的场次吧？或者你说个偏好的时间～",
+            "ask_ticket_count": "默认帮你订2张，要调整吗？",
+            "get_seats": "想坐哪个位置？中间、前排还是后排？",
+        }
+        message = ack_messages.get(state.pending_action, message)
+
     return {
         "result": ToolResult(
             tool_name=action,
             message=message,
         )
     }
+
+
+def _build_ask_message(state: "AgentState", plan: "AgentPlan") -> str:
+    """Build a personalized ask message based on what's known and missing."""
+    params = plan.params or {}
+    missing = params.get("missing", [])
+    filled = params.get("filled", {})
+    next_ask = params.get("next_ask", "")
+
+    # Defaults with personalisation
+    movie_name = filled.get("movieName", "")
+    ticket_count = filled.get("ticketCount", "")
+    cinema_name = filled.get("cinemaName", "")
+
+    ask_templates = {
+        "movieName": lambda: (
+            f"好的～想看哪部电影呢？"
+            if not filled else
+            f"想看哪部电影呢？"
+        ),
+        "genre": lambda: "想看什么类型的？喜剧、动作、科幻、动画都可以～",
+        "ticketCount": lambda: (
+            f"{movie_name}很不错！想买几张票呢？"
+            if movie_name else
+            "想买几张票呢？"
+        ),
+        "date": lambda: (
+            f"《{movie_name}》～想看哪天的？比如今天、明天或者周末"
+            if movie_name else
+            "想看哪天的场次？今天、明天还是周末？"
+        ),
+        "timeRange": lambda: (
+            f"《{movie_name}》～想看什么时间段的？比如上午、下午、晚上"
+            if movie_name else
+            "想看什么时间段的？上午、下午还是晚上？"
+        ),
+        "cinemaName": lambda: "有想去的影院吗？或者我帮你查查附近有哪些～",
+        "showtimeId": lambda: "我帮你查了场次，选一个合适的吧～",
+        "seatIds": lambda: "座位图准备好了，选几个座位吧～",
+    }
+
+    if next_ask and next_ask in ask_templates:
+        return ask_templates[next_ask]()
+
+    # Generic fallback
+    if missing:
+        return f"还需要确认一下信息～"
+
+    return "嗨～ 有什么想看的吗？我可以帮你查电影、选场次、选座。"
+
 
 
 def tool_node(data: AgentGraphState) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.clients import mcp_dispatcher
+from app.clients.web_search import search_web
 from app.rag.service import rag_service
 from app.schemas.agent import AgentPlan, AgentState, ToolResult
 
@@ -11,6 +12,8 @@ class AgentToolbox:
 
         if action == "answer_with_rag":
             return self.answer_with_rag(plan.params.get("query") or state.last_user_text)
+        if action == "general_answer":
+            return self.answer_general(plan.params.get("query") or state.last_user_text)
         if action == "answer_price":
             return self.answer_price(plan.params, state)
         if action == "get_current_location":
@@ -31,6 +34,7 @@ class AgentToolbox:
             "get_refund_status",
             "get_order",
             "list_orders",
+            "cancel_order",
         }:
             if not plan.params.get("jwt"):
                 return self.auth_required(action)
@@ -181,7 +185,66 @@ class AgentToolbox:
                 tool_name="rag.answer",
                 success=False,
                 data={"error": str(exc)},
-                message="知识库回答暂时不可用，请稍后重试或改为查询业务接口。",
+                message="知识库暂时不可用。你可以直接问我也行，我试试用其他方式回答～",
+            )
+
+    def answer_general(self, query: str) -> ToolResult:
+        """Answer ANY question using LLM + optional web search.
+        This is the fallback for anything outside the booking pipeline."""
+        try:
+            web_results = search_web(query)
+            web_context = ""
+            if web_results:
+                web_context = "\n".join(
+                    f"- {r['snippet']}" for r in web_results[:3]
+                )
+
+            import os, json
+            from openai import OpenAI
+            from app.utils.config_handler import agent_config
+
+            llm = agent_config.get("llm", {})
+            client = OpenAI(
+                api_key=os.getenv(llm.get("api_key_env", "DASHSCOPE_API_KEY")),
+                base_url=llm.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+                timeout=llm.get("timeout_seconds", 20),
+            )
+
+            system_prompt = (
+                "你是一个友好、博学的电影助手。"
+                "用户可能会问关于电影、演员、导演、剧情、票房、上映时间等各种问题。"
+                "请用自然的口吻回答，像朋友聊天一样。"
+                "如果下面提供了搜索结果，请结合搜索结果回答。"
+                "回答不要太长，控制在200字以内。"
+            )
+            user_msg = f"用户问：{query}"
+            if web_context:
+                user_msg += f"\n\n搜索结果供参考：\n{web_context}"
+
+            response = client.chat.completions.create(
+                model=llm.get("chat_model_name", "qwen-turbo"),
+                temperature=0.7,
+                max_tokens=500,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            message = response.choices[0].message.content or ""
+            return ToolResult(
+                tool_name="general_answer",
+                data={"query": query, "webResults": bool(web_results)},
+                message=message.strip(),
+            )
+        except Exception as exc:
+            return ToolResult(
+                tool_name="general_answer",
+                success=False,
+                data={"error": str(exc)},
+                message=(
+                    "这个问题我暂时不太好回答。要不咱们聊聊电影？"
+                    "我可以帮你查最近上映的片子、附近影院，或者直接帮你订票～"
+                ),
             )
 
     def answer_price(

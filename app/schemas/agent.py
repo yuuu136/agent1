@@ -26,7 +26,10 @@ AgentAction = Literal[
     "get_order",
     "list_orders",
     "cancel",
+    "cancel_order",
     "smalltalk",
+    "general_answer",
+    "ask",
 ]
 
 
@@ -81,6 +84,7 @@ class AgentState(BaseModel):
     selected: dict[str, Any] = Field(default_factory=dict)
     pending_action: str | None = None
     last_user_text: str = ""
+    last_bot_message: str = ""
     history: list[dict[str, Any]] = Field(default_factory=list)
 
 

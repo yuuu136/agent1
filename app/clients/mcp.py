@@ -39,6 +39,7 @@ class SpringBootMovieTicketMCP:
             "create_order": self.create_order,
             "pay_order": self.pay_order,
             "issue_ticket": self.issue_ticket,
+            "cancel_order": self.cancel_order,
             "refund_order": self.refund_order,
             "get_refund_status": self.get_refund_status,
             "get_order": self.get_order,
@@ -127,6 +128,19 @@ class SpringBootMovieTicketMCP:
                 or arguments.get("cinemaName")
                 or "当前影院"
             )
+            cinema_msg = self._fallback_movie_search_message(
+                fallback_reason,
+                arguments,
+                movies,
+            ) or self._movie_search_message(
+                movies,
+                recommendation_criteria,
+                cinema_name=cinema_name,
+                has_showtimes=True,
+                genre=arguments.get("genre"),
+                keyword=keyword,
+                date=arguments.get("date"),
+            )
             return ToolResult(
                 tool_name="spring_boot.search_movies",
                 data={
@@ -137,20 +151,8 @@ class SpringBootMovieTicketMCP:
                     "fallbackReason": fallback_reason,
                     "source": "spring_boot_database",
                 },
-                message=self._fallback_movie_search_message(
-                    fallback_reason,
-                    arguments,
-                    movies,
-                )
-                or self._movie_search_message(
-                    movies,
-                    recommendation_criteria,
-                    cinema_name=cinema_name,
-                    has_showtimes=True,
-                    genre=arguments.get("genre"),
-                    keyword=keyword,
-                    date=arguments.get("date"),
-                ),
+                message=cinema_msg,
+                suggestions=self._browse_suggestions(movies, arguments),
             )
 
         all_movies = self._load_movie_cards(
@@ -168,10 +170,27 @@ class SpringBootMovieTicketMCP:
                 arguments,
                 all_movies,
             )
+        # Keyword/genre search got nothing → show all available movies
+        if not movies and not fallback_reason and (keyword or arguments.get("genre") or arguments.get("movieName")):
+            movies = self._load_movie_cards(arguments, keyword=None, genre=None)
+            movies = self._filter_movie_cards_by_showtime_constraints(movies, arguments)
+            if movies:
+                fallback_reason = "keyword_not_found"
         movies = self._rank_recommended_movies(movies, recommendation_criteria)
         movies = self._apply_movie_limit(
             movies,
             arguments.get("movieLimit") or (3 if fallback_reason else None),
+        )
+        message = self._fallback_movie_search_message(
+            fallback_reason,
+            arguments,
+            movies,
+        ) or self._movie_search_message(
+            movies,
+            recommendation_criteria,
+            genre=arguments.get("genre"),
+            keyword=keyword,
+            date=arguments.get("date"),
         )
         return ToolResult(
             tool_name="spring_boot.search_movies",
@@ -181,18 +200,8 @@ class SpringBootMovieTicketMCP:
                 "fallbackReason": fallback_reason,
                 "source": "spring_boot_database",
             },
-            message=self._fallback_movie_search_message(
-                fallback_reason,
-                arguments,
-                movies,
-            )
-            or self._movie_search_message(
-                movies,
-                recommendation_criteria,
-                genre=arguments.get("genre"),
-                keyword=keyword,
-                date=arguments.get("date"),
-            ),
+            message=message,
+            suggestions=self._browse_suggestions(movies, arguments),
         )
 
     def search_showtimes(self, arguments: dict[str, Any]) -> ToolResult:
@@ -433,6 +442,20 @@ class SpringBootMovieTicketMCP:
             ),
         )
 
+    def cancel_order(self, arguments: dict[str, Any]) -> ToolResult:
+        """Cancel a pending order to release locked seats."""
+        order_id = self._required_long(arguments.get("orderId"), "订单 ID")
+        self._post_business(
+            f"/api/user/orders/{order_id}/cancel",
+            arguments,
+            {},
+        )
+        return ToolResult(
+            tool_name="spring_boot.cancel_order",
+            data={"orderId": order_id, "status": "cancelled"},
+            message="已释放之前锁定的座位。",
+        )
+
     def refund_order(self, arguments: dict[str, Any]) -> ToolResult:
         order_id = self._required_long(arguments.get("orderId"), "订单 ID")
         raw = self._post_business(
@@ -591,12 +614,14 @@ class SpringBootMovieTicketMCP:
             )
 
         lng, lat = self._split_location(location)
+        cinema_limit = arguments.get("cinemaLimit")
         data = self._get_business(
             "/api/user/cinemas/nearby",
             arguments,
             {
                 "page": arguments.get("page", 1),
-                "size": arguments.get("size", 10),
+                "size": cinema_limit if isinstance(cinema_limit, int) and cinema_limit > 0
+                        else arguments.get("size", 10),
                 "lat": lat,
                 "lng": lng,
                 "radius": arguments.get("radius", 5),
@@ -1373,6 +1398,15 @@ class SpringBootMovieTicketMCP:
                 f"按{constraints}今天暂时没有符合条件的场次，"
                 "为你找到明天相同类型的可选场次。"
             )
+        elif fallback_reason == "keyword_not_found":
+            movie_name = arguments.get("movieName") or arguments.get("keyword") or ""
+            genre = arguments.get("genre") or ""
+            if movie_name:
+                message = f"没有找到《{movie_name}》，不过这些也不错"
+            elif genre:
+                message = f"没有找到{genre}类型的影片，看看这些怎么样"
+            else:
+                message = "没有找到匹配的影片，这些也很棒"
         else:
             return None
 
@@ -1390,26 +1424,21 @@ class SpringBootMovieTicketMCP:
         date_label: str = "",
     ) -> str:
         date_prefix = f"{date_label}" if date_label else ""
+        criteria_label = str(criteria or "").strip()
+        is_recommend = criteria_label in ("hot", "high_rating", "new_release", "couple", "general")
+
+        # Recommendation style ("推荐几部" → natural language)
         if genre_label:
-            return f"为你找到了 {count} 部{date_prefix}{genre_label}片"
+            return f"为你挑了 {count} 部{date_prefix}{genre_label}片"
         if keyword_label:
-            return f"为你找到了 {count} 部与「{keyword_label}」相关的{date_prefix}影片"
-        labels = {
-            "couple": "适合情侣一起观看的",
-            "family": "适合亲子或家庭的",
-            "high_rating": "高分口碑",
-            "box_office": "当前可购的",
-            "hot": "当前热映的",
-            "general": "值得关注的",
-        }
-        label = labels.get(str(criteria or "").strip())
-        if label:
-            return f"为你找到了 {count} 部{label}{date_prefix}影片"
+            return f"关于「{keyword_label}」，有 {count} 部{date_prefix}影片"
+        if is_recommend:
+            return f"为你挑了 {count} 部值得一看的{date_prefix}影片"
         if cinema_name:
             action = "正在排片" if has_showtimes else "正在上映"
             return f"{cinema_name}有 {count} 部电影{date_prefix}{action}"
         if date_label:
-            return f"{date_prefix}有 {count} 部电影正在上映"
+            return f"{date_label}有 {count} 部电影正在上映"
         return f"当前有 {count} 部电影正在上映"
 
     @staticmethod
@@ -1441,6 +1470,26 @@ class SpringBootMovieTicketMCP:
                 lines.append(f"• 《{name}》")
                 lines.extend(f"  {part}" for part in parts)
         return "\n".join(lines)
+
+    @staticmethod
+    def _browse_suggestions(
+        movies: list[dict[str, Any]],
+        arguments: dict[str, Any],
+    ) -> list[str]:
+        """Suggest next actions after a movie search, useful when zero results."""
+        if movies:
+            return []
+        genre = str(arguments.get("genre") or "").strip()
+        keyword = str(arguments.get("keyword") or "").strip()
+        suggestions: list[str] = []
+        if genre:
+            suggestions.append("换个类型试试")
+        if keyword:
+            suggestions.append("换个关键词试试")
+        if not genre and not keyword:
+            suggestions.append("最近有什么好电影")
+        suggestions.extend(["最近热映", "附近有什么影院"])
+        return suggestions[:4]
 
     def _pick_movie(
         self,
