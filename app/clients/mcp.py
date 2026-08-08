@@ -527,7 +527,7 @@ class SpringBootMovieTicketMCP:
             arguments,
             {
                 "page": arguments.get("page", 1),
-                "size": arguments.get("size", 20),
+                "size": 5,
                 "status": arguments.get("status"),
             },
         )
@@ -538,10 +538,10 @@ class SpringBootMovieTicketMCP:
                 "records": [self._format_order(item) for item in records],
                 "total": raw.get("total", len(records)),
                 "page": raw.get("page", arguments.get("page", 1)),
-                "size": raw.get("size", arguments.get("size", 20)),
+                "size": raw.get("size", 5),
                 "source": "spring_boot_database",
             },
-            message=f"已从票务数据库加载 {len(records)} 个订单。",
+            message="目前只展示近期5笔订单，更多订单请查看订单列表。",
         )
 
     def search_nearby_cinemas(self, arguments: dict[str, Any]) -> ToolResult:
@@ -795,6 +795,7 @@ class SpringBootMovieTicketMCP:
             "orderId": raw.get("orderId") or fallback_order_id,
             "status": raw.get("status"),
             "amount": raw.get("amount"),
+            "serviceFee": raw.get("serviceFee"),
             "outRequestNo": raw.get("outRequestNo"),
             "message": raw.get("message"),
             "updatedAt": raw.get("updatedAt"),
@@ -893,6 +894,7 @@ class SpringBootMovieTicketMCP:
                 "cinemaName": s.get("cinemaName"),
                 "hallName": s.get("hallName"),
                 "startAt": s.get("startAt"),
+                "endAt": s.get("endAt"),
                 "price": s.get("price"),
             }
             for s in upcoming
@@ -1069,13 +1071,21 @@ class SpringBootMovieTicketMCP:
                 cinema = st.get("cinemaName") or ""
                 hall = st.get("hallName") or ""
                 start = st.get("startAt") or ""
+                end = st.get("endAt") or ""
                 price = st.get("price") or ""
                 price_text = f" {price}元" if price else ""
-                time_text = str(start)[:16].replace("T", " ") if start else ""
+                start_text = str(start)[:16].replace("T", " ") if start else ""
+                end_text = str(end)[:16].replace("T", " ") if end else ""
+                time_text = f"{start_text} - {end_text}" if start_text and end_text else start_text
                 where = f"{cinema} {hall}".strip()
-                parts.append(f"{where} {time_text}{price_text}")
+                parts.append(
+                    " · ".join(
+                        part for part in [where, time_text, price_text.strip()] if part
+                    )
+                )
             if parts:
-                lines.append(f"• 《{name}》" + "；".join(parts))
+                lines.append(f"• 《{name}》")
+                lines.extend(f"  {part}" for part in parts)
         return "\n".join(lines)
 
     def _pick_movie(
@@ -1209,9 +1219,16 @@ class SpringBootMovieTicketMCP:
         if requested_time in {"evening", "晚上"}:
             return value >= "18:00"
         if requested_time in {"afternoon", "下午"}:
-            return "12:00" <= value < "18:00"
+            return "12:00" <= value < "19:00"
         if requested_time in {"morning", "上午"}:
             return value < "12:00"
+        # 用户说“16点”时匹配该小时内的场次，避免把晚上的场次一并返回。
+        match = re.fullmatch(r"(\d{2}):(\d{2})", requested_time)
+        if match:
+            hour, minute = match.groups()
+            if minute == "00":
+                return value.startswith(f"{hour}:")
+            return value == requested_time
         return value >= requested_time
 
     def _should_auto_navigate(
@@ -1279,11 +1296,18 @@ class SpringBootMovieTicketMCP:
         }.get(text, f"{text}后")
 
     def _showtime_subtitle(self, showtime: dict[str, Any]) -> str:
+        start_at = str(showtime.get("startAt") or "")
+        end_at = str(showtime.get("endAt") or "")
+        start_text = start_at[:16].replace("T", " ") if start_at else ""
+        end_text = end_at[:16].replace("T", " ") if end_at else ""
+        time_text = f"{start_text} - {end_text}" if start_text and end_text else (
+            start_text or end_text or showtime.get("time")
+        )
         parts = [
             showtime.get("movieName"),
             showtime.get("cinemaName"),
-            showtime.get("date"),
-            showtime.get("time"),
+            showtime.get("hallName"),
+            time_text,
         ]
         return " ".join(str(part) for part in parts if part)
 
@@ -1297,6 +1321,11 @@ class SpringBootMovieTicketMCP:
             "cinemaName": cinema_name,
             "address": item.get("address"),
             "district": item.get("district"),
+            "services": (
+                item.get("services")
+                or item.get("serviceTags")
+                or item.get("service")
+            ),
             "location": (
                 f"{longitude},{latitude}"
                 if longitude is not None and latitude is not None
