@@ -122,7 +122,7 @@ class LLMNLU:
                     intent="book_ticket",
                     confidence=0.92,
                     intent_source="rule",
-                    slots=dict(payload.get("slots", {}) or {}),
+                    slots=self._extract_booking_slots(text, payload),
                 )
 
         # ── payload-driven intents: event-based ──
@@ -259,6 +259,14 @@ class LLMNLU:
             )
             parsed = json.loads((response.choices[0].message.content or "").strip())
         except Exception:
+            if self._is_booking_request_text(text):
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.80,
+                    intent_source="rule",
+                    slots=self._extract_booking_slots(text, payload),
+                    reference_text=text,
+                )
             return NLUResult(intent="smalltalk", confidence=0.30, intent_source="rule")
 
         intent = str(parsed.get("intent") or "smalltalk")
@@ -298,6 +306,45 @@ class LLMNLU:
             reference_text=str(parsed.get("reference") or text),
         )
 
+    def _extract_booking_slots(
+        self,
+        text: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        slots = dict(payload.get("slots", {}) or {})
+        if payload.get("location") not in [None, ""]:
+            slots["location"] = payload.get("location")
+
+        ticket_count = self._extract_ticket_count(text)
+        if ticket_count is not None:
+            slots["ticketCount"] = ticket_count
+
+        date_value = self._extract_date(text)
+        if date_value:
+            slots["date"] = date_value
+
+        time_range = self._extract_time_range(text)
+        if time_range:
+            slots["timeRange"] = time_range
+
+        seat_positions = self._extract_seat_positions(text)
+        if seat_positions:
+            slots["seatPositions"] = seat_positions
+
+        genre = self._extract_genre(text)
+        if genre:
+            slots["genre"] = genre
+
+        snack_requests = self._extract_snack_requests(text)
+        if snack_requests:
+            slots["snackRequests"] = snack_requests
+
+        movie_name = self._extract_movie_name(text, snack_requests)
+        if movie_name:
+            slots["movieName"] = movie_name
+
+        return slots
+
     def _extract_seat_positions(self, text: str) -> list[dict[str, int]]:
         normalized = re.sub(r"\s+", "", text)
         pattern = re.compile(
@@ -315,6 +362,127 @@ class LLMNLU:
             if position not in positions:
                 positions.append(position)
         return positions
+
+    def _extract_ticket_count(self, text: str) -> int | None:
+        normalized = re.sub(r"\s+", "", text)
+        match = re.search(r"(?P<count>[0-9一二两三四五六七八九十]+)\s*(?:张|份|个)?(?:电影票|影票|票)", normalized)
+        if not match:
+            match = re.search(r"(?:买|订|要|来)(?P<count>[0-9一二两三四五六七八九十]+)张", normalized)
+        if not match:
+            return None
+        count = self._parse_number_token(match.group("count"))
+        return count if count and count > 0 else None
+
+    def _extract_date(self, text: str) -> str | None:
+        if "后天" in text:
+            return "after_tomorrow"
+        if "明天" in text or "明晚" in text:
+            return "tomorrow"
+        if "今天" in text or "今晚" in text:
+            return "today"
+        if "周末" in text:
+            return "weekend"
+        return None
+
+    def _extract_time_range(self, text: str) -> str | None:
+        normalized = re.sub(r"\s+", "", text)
+        period_match = re.search(r"(上午|早上|中午|下午|晚上|今晚|明晚)?([0-9一二两三四五六七八九十]{1,3})(?:[:：点])([0-9一二两三四五六七八九十]{0,2})?(半)?", normalized)
+        if period_match:
+            period = period_match.group(1) or ""
+            hour = self._parse_number_token(period_match.group(2))
+            minute_text = period_match.group(3)
+            minute = self._parse_number_token(minute_text) if minute_text else 0
+            if period_match.group(4):
+                minute = 30
+            if hour is not None and minute is not None:
+                if period in {"下午", "晚上", "今晚", "明晚"} and 1 <= hour < 12:
+                    hour += 12
+                if period == "中午" and hour < 11:
+                    hour += 12
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return f"{hour:02d}:{minute:02d}"
+
+        if any(value in normalized for value in ["今晚", "明晚", "晚上"]):
+            return "evening"
+        if "下午" in normalized:
+            return "afternoon"
+        if "上午" in normalized or "早上" in normalized:
+            return "morning"
+        return None
+
+    def _extract_genre(self, text: str) -> str | None:
+        for genre in ["喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"]:
+            if genre in text:
+                return genre
+        return None
+
+    def _extract_snack_requests(self, text: str) -> list[dict[str, Any]]:
+        normalized = re.sub(r"\s+", "", text)
+        snack_names = r"爆米花|可乐|薯条|热狗|饮料|套餐"
+        connector = re.search(
+            rf"(?:和|加|再加|再来|以及|外加)"
+            rf"(?=[0-9一二两三四五六七八九十]*"
+            rf"(?:桶|瓶|杯|份|个|盒)?(?:{snack_names}))",
+            normalized,
+        )
+        if not connector:
+            return []
+
+        tail = normalized[connector.end():]
+        pattern = re.compile(
+            rf"(?P<quantity>[0-9一二两三四五六七八九十]+)?"
+            rf"(?P<unit>桶|瓶|杯|份|个|盒)?"
+            rf"(?P<name>{snack_names})"
+        )
+        requests: list[dict[str, Any]] = []
+        for match in pattern.finditer(tail):
+            quantity = self._parse_number_token(match.group("quantity") or "一") or 1
+            requests.append(
+                {
+                    "name": match.group("name"),
+                    "quantity": max(1, quantity),
+                    "unit": match.group("unit") or "份",
+                }
+            )
+        return requests
+
+    def _extract_movie_name(
+        self,
+        text: str,
+        snack_requests: list[dict[str, Any]] | None = None,
+    ) -> str:
+        cleaned = re.sub(r"\s+", "", text)
+        if snack_requests:
+            snack_names = r"爆米花|可乐|薯条|热狗|饮料|套餐"
+            cleaned = re.sub(
+                rf"(?:和|加|再加|再来|以及|外加)"
+                rf"[0-9一二两三四五六七八九十]*(?:桶|瓶|杯|份|个|盒)?"
+                rf"(?:{snack_names}).*$",
+                "",
+                cleaned,
+            )
+        cleaned = re.sub(
+            r"[0-9一二两三四五六七八九十]+排[0-9一二两三四五六七八九十]+(?:座|号|位)?",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"[0-9一二两三四五六七八九十]+张(?:电影票|影票|票)?", "", cleaned)
+        cleaned = re.sub(r"(今天|今晚|明天|明晚|后天|周末)", "", cleaned)
+        cleaned = re.sub(
+            r"(上午|早上|中午|下午|晚上)?[0-9一二两三四五六七八九十]{1,3}[:：点][0-9一二两三四五六七八九十]{0,2}(?:半)?(?:左右|前后|以后|之后|之前|前)?的?",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"^(给我|帮我|我要|我想|想要|请帮我|麻烦帮我|买|订|预订|来|看|想看|去看)+",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"(电影票|影票|电影|影片|票)+$", "", cleaned)
+        cleaned = cleaned.strip("的《》<>【】[]()，,。.!?！？：:")
+        if cleaned in {"", "片", "部片", "一部片", "喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}:
+            return ""
+        return cleaned
 
     def _extract_multi_movie_names(self, text: str) -> list[str]:
         normalized = re.sub(r"\s+", "", text)

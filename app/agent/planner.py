@@ -365,7 +365,8 @@ class TaskPlanner:
                     reason="购票信息齐全，查场次",
                     params=self._pick(slots, ["movieName", "movieId", "date", "timeRange",
                         "ticketCount", "cinemaId", "cinemaName", "hallType",
-                        "notHallType", "maxPrice"]),
+                        "notHallType", "maxPrice", "seatPositions",
+                        "snackRequests"]),
                     state="selecting_showtime",
                 )
             return AgentPlan(
