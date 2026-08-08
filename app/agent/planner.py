@@ -82,6 +82,7 @@ class TaskPlanner:
                         "date",
                         "hallType",
                         "recommendationCriteria",
+                        "movieLimit",
                     ],
                 ),
                 state="selecting_movie",
@@ -356,7 +357,15 @@ class TaskPlanner:
                 reason="购票流程先查电影",
                 params=self._pick(
                     slots,
-                    ["genre", "city", "cinemaId", "cinemaName", "date", "hallType"],
+                    [
+                        "genre",
+                        "city",
+                        "cinemaId",
+                        "cinemaName",
+                        "date",
+                        "hallType",
+                        "movieLimit",
+                    ],
                 ),
                 state="selecting_movie",
             )

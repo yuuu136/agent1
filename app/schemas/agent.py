@@ -62,6 +62,9 @@ class DraftMergeRequest(BaseModel):
 class NLUResult(BaseModel):
     intent: str = "smalltalk"
     confidence: float = 0.0
+    intent_source: str = "rule"
+    rag_score: float | None = None
+    rag_example: str | None = None
     slots: dict[str, Any] = Field(default_factory=dict)
     is_modification: bool = False
     reference_text: str = ""
