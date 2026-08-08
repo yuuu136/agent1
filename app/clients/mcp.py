@@ -60,14 +60,14 @@ class SpringBootMovieTicketMCP:
                     tool_name=f"spring_boot.{tool_name}",
                     success=False,
                     data={"error": "AUTH_REQUIRED"},
-                    message="登录状态已失效，请重新登录后再查询电影票。",
+                    message="登录信息已过期，重新登录后我再帮你查。",
                 )
             if isinstance(exc, httpx.RequestError):
-                message = "票务数据库暂时无法连接，请确认 Spring Boot 服务已启动。"
+                message = "票务服务暂时连不上，稍后我再帮你查。"
             elif error_text:
                 message = error_text
             else:
-                message = "票务数据库查询失败，请确认 Spring Boot 服务和登录状态正常。"
+                message = "查询出了点小问题，稍后再试一下。"
             return ToolResult(
                 tool_name=f"spring_boot.{tool_name}",
                 success=False,
@@ -248,7 +248,7 @@ class SpringBootMovieTicketMCP:
                 tool_name="spring_boot.get_seats",
                 success=False,
                 data={"error": "SHOWTIME_REQUIRED"},
-                message="缺少场次 ID，无法查询座位图。",
+                message="还没选场次呢，请先选择一个场次。",
             )
         data = self._get_business(
             f"/api/user/showtimes/{showtime_id}/seats",
@@ -278,7 +278,7 @@ class SpringBootMovieTicketMCP:
                 "seats": seats,
                 "raw": data,
             },
-            message="已从票务数据库加载座位图。",
+            message="座位图准备好了，看看坐哪吧。",
         )
 
     def _normalize_seat_status(self, value: Any) -> str:
@@ -348,7 +348,7 @@ class SpringBootMovieTicketMCP:
         return ToolResult(
             tool_name="spring_boot.lock_seats",
             data=data,
-            message=f"已锁定 {len(seat_ids)} 个座位，订单已创建。",
+            message=f"好的，已帮你锁定 {len(seat_ids)} 个座位，订单已生成。",
         )
 
     def recommend_snacks(self, arguments: dict[str, Any]) -> ToolResult:
@@ -377,7 +377,7 @@ class SpringBootMovieTicketMCP:
                 "snacks": snacks,
                 "source": "spring_boot_database",
             },
-            message=f"已从{cinema_name}加载 {len(snacks)} 个可选零食套餐。",
+            message=f"{cinema_name}有 {len(snacks)} 款零食套餐可以选——",
         )
 
     def replace_order_snacks(self, arguments: dict[str, Any]) -> ToolResult:
@@ -393,9 +393,9 @@ class SpringBootMovieTicketMCP:
             tool_name="spring_boot.replace_order_snacks",
             data=data,
             message=(
-                "零食已加入订单，"
-                f"零食金额 {self._format_yuan(data.get('snackAmount'))}，"
-                f"合计 {self._format_yuan(data.get('totalAmount'))}。"
+                "零食已加入订单！"
+                f"零食 {self._format_yuan(data.get('snackAmount'))}，"
+                f"总计 {self._format_yuan(data.get('totalAmount'))}。"
             ),
         )
 
@@ -477,11 +477,11 @@ class SpringBootMovieTicketMCP:
             tool_name="spring_boot.pay_order",
             data=data,
             message=(
-                "支付成功，电子票已出票。"
+                "支付成功！电子票已出票，祝你观影愉快 🎬"
                 if data["ticketStatus"] == "issued"
-                else "支付成功。"
+                else "支付成功！"
                 if payment_status == "SUCCESS"
-                else "支付二维码已生成，请扫码支付。"
+                else "二维码已生成，扫码就能支付。"
             ),
         )
 
@@ -497,7 +497,7 @@ class SpringBootMovieTicketMCP:
         return ToolResult(
             tool_name="spring_boot.issue_ticket",
             data=data,
-            message="订单已经出票。" if data.get("ticketStatus") == "issued" else "订单尚未出票。",
+            message="已出票，祝你观影愉快 🎬" if data.get("ticketStatus") == "issued" else "订单还未出票，先完成支付吧。",
         )
 
     def get_order(self, arguments: dict[str, Any]) -> ToolResult:
@@ -510,13 +510,13 @@ class SpringBootMovieTicketMCP:
         data = self._format_order(raw, order_id)
         status = str(data.get("status") or "").upper()
         if status == "TICKETED" or data.get("ticketStatus") == "issued":
-            message = "支付成功，电子票已出票。"
+            message = "已出票，祝你观影愉快 🎬"
         elif status in {"PAYMENT_PENDING", "PENDING"}:
-            message = "订单仍待支付，请完成支付宝沙箱支付后再查看。"
+            message = "订单还在等你支付哦，付完就能出票了。"
         elif status in {"CANCELLED", "CANCELED", "CLOSED"}:
-            message = "订单已关闭或取消。"
+            message = "这个订单已关闭。"
         else:
-            message = "订单已加载。"
+            message = "订单信息已找到。"
         return ToolResult(
             tool_name="spring_boot.get_order",
             data=data,
@@ -543,7 +543,7 @@ class SpringBootMovieTicketMCP:
                 "size": raw.get("size", 5),
                 "source": "spring_boot_database",
             },
-            message="目前只展示近期5笔订单，更多订单请查看订单列表。",
+            message="以下是近期 5 笔订单——",
         )
 
     def search_nearby_cinemas(self, arguments: dict[str, Any]) -> ToolResult:
@@ -553,7 +553,7 @@ class SpringBootMovieTicketMCP:
                 tool_name="spring_boot.search_nearby_cinemas",
                 success=False,
                 data={"error": "LOCATION_REQUIRED"},
-                message="未获取到当前位置，无法按数据库距离匹配影院。请允许浏览器定位后重试。",
+                message="需要获取你的位置才能查附近影院，请打开浏览器定位后告诉我。",
             )
 
         lng, lat = self._split_location(location)
@@ -579,9 +579,9 @@ class SpringBootMovieTicketMCP:
                 "total": data.get("total", len(cinemas)),
             },
             message=(
-                f"已按当前位置在票务数据库中找到 {len(cinemas)} 家影院。"
+                f"在你附近找到了 {len(cinemas)} 家影院。"
                 if cinemas
-                else "当前位置附近暂未匹配到数据库中的影院。"
+                else "当前位置附近暂时没有匹配到影院。"
             ),
         )
 
@@ -808,10 +808,10 @@ class SpringBootMovieTicketMCP:
         status = str(data.get("status") or "").upper()
         amount = self._format_yuan(data.get("amount"))
         if status == "SUCCESS":
-            return f"退票申请已完成，退款金额 {amount}。"
+            return f"退票已处理，预计退回 {amount}，1-3 个工作日到账。"
         if status == "FAIL":
-            return data.get("message") or "退票失败，请查看订单详情或联系客服。"
-        return f"退票申请已提交，当前状态：{data.get('status') or '处理中'}，金额 {amount}。"
+            return data.get("message") or "退票暂时没成功，去订单详情看看或联系客服吧。"
+        return f"退票申请已提交，当前状态：{data.get('status') or '处理中'}，预计退回 {amount}。"
 
     def _format_yuan(self, value: Any) -> str:
         if value in [None, ""]:
@@ -838,7 +838,7 @@ class SpringBootMovieTicketMCP:
         response.raise_for_status()
         payload = response.json()
         if payload.get("code") not in [0, 1, None]:
-            message = payload.get("msg") or payload.get("message") or "票务数据库查询失败。"
+            message = payload.get("msg") or payload.get("message") or "票务服务查询失败。"
             raise ValueError(message)
         return payload.get("data") or {}
 
@@ -857,7 +857,7 @@ class SpringBootMovieTicketMCP:
         response.raise_for_status()
         payload = response.json()
         if payload.get("code") not in [0, 1, None]:
-            message = payload.get("msg") or payload.get("message") or "票务数据库请求失败。"
+            message = payload.get("msg") or payload.get("message") or "票务服务请求失败。"
             raise ValueError(message)
         return payload.get("data") or {}
 
@@ -876,7 +876,7 @@ class SpringBootMovieTicketMCP:
         response.raise_for_status()
         payload = response.json()
         if payload.get("code") not in [0, 1, None]:
-            message = payload.get("msg") or payload.get("message") or "票务数据库请求失败。"
+            message = payload.get("msg") or payload.get("message") or "票务服务请求失败。"
             raise ValueError(message)
         return payload.get("data") or {}
 
@@ -1389,12 +1389,12 @@ class AMapMCP:
         if detail.startswith("Missing environment variable:"):
             return "高德地图未配置 API Key，请检查 AMAP_WEB_SERVICE_KEY。"
         if detail.startswith("AMap API error:"):
-            return f"高德地图服务返回错误：{detail.removeprefix('AMap API error:').strip()}"
+            return f"地图服务出了点问题：{detail.removeprefix('AMap API error:').strip()}"
         if isinstance(error, httpx.HTTPStatusError):
-            return f"高德地图 HTTP 请求失败：{error.response.status_code}。"
+            return f"地图服务连不上 ({error.response.status_code})，稍后重试吧。"
         if isinstance(error, httpx.RequestError):
-            return "高德地图暂时无法连接，请检查 Agent 服务的网络权限或代理配置。"
-        return "高德地图请求失败，请稍后重试。"
+            return "地图服务暂时连不上，稍后再试试。"
+        return "地图查询失败，请稍后重试。"
 
     def search_nearby_cinemas(self, arguments: dict[str, Any]) -> ToolResult:
         location = self._normalize_location(arguments.get("location"))
@@ -1406,7 +1406,7 @@ class AMapMCP:
                 tool_name="amap.search_nearby_cinemas",
                 success=False,
                 data={"error": "LOCATION_REQUIRED"},
-                message="未获取到当前位置，无法准确查询附近影院。请允许浏览器定位后重试。",
+                message="需要获取你的位置才能查附近影院，请打开浏览器定位后告诉我。",
             )
 
         if location:
@@ -1438,7 +1438,7 @@ class AMapMCP:
         return ToolResult(
             tool_name="amap.search_nearby_cinemas",
             data={"cinemas": cinemas, "raw": payload},
-            message="AMap cinema search completed." if cinemas else "AMap returned no matching cinemas.",
+            message="已找到附近影院。" if cinemas else "没找到匹配的影院。",
         )
 
     def geocode(self, arguments: dict[str, Any]) -> ToolResult:
@@ -1449,7 +1449,7 @@ class AMapMCP:
         return ToolResult(
             tool_name="amap.geocode",
             data={"geocodes": payload.get("geocodes", []), "raw": payload},
-            message="AMap geocode completed.",
+            message="地址解析完成。",
         )
 
     def regeocode(self, arguments: dict[str, Any]) -> ToolResult:
@@ -1464,7 +1464,7 @@ class AMapMCP:
         return ToolResult(
             tool_name="amap.regeocode",
             data={"regeocode": payload.get("regeocode", {}), "raw": payload},
-            message="AMap regeocode completed.",
+            message="位置解析完成。",
         )
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
