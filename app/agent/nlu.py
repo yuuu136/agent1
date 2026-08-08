@@ -183,7 +183,12 @@ class RuleBasedNLU:
         if self._is_explicit_showtime_booking_text(text):
             return "book_ticket"
         if _contains_catalog_term(text, "nearby_cinema"):
-            return "nearby_cinema"
+            if "最近" in text and ("上映" in text or "新片" in text
+                                  or self._extract_movie_name(text)
+                                  or self._extract_genre(text)):
+                pass  # temporal "最近", not spatial, keep going to movie checks
+            else:
+                return "nearby_cinema"
         if _contains_catalog_term(lowered, "nearby_cinema_english"):
             return "nearby_cinema"
         if self._is_location_query_text(text):
@@ -715,7 +720,7 @@ class RuleBasedNLU:
             "",
             value,
         )
-        value = re.sub(r"(?:今天|今晚|明天|明晚|晚上|下午|上午)", "", value)
+        value = re.sub(r"(?:最近|今天|今晚|明天|明晚|晚上|下午|上午)", "", value)
         value = re.sub(r"(?:\d{1,2}|[一二两三四五六七八九十]{1,2})(?:点|:)\d{0,2}(?:半)?", "", value)
         value = re.sub(r"(?:IMAX|imax|杜比|巨幕|激光|场次|场|影厅|厅)", "", value)
         value = re.sub(
@@ -729,6 +734,8 @@ class RuleBasedNLU:
         value = value.strip(" ，。,.!?！？的")
         value = value.strip("《》「」『』“”\"' ")
         value = value.strip(" ，。,.!?！？的")
+        value = re.sub(r"^(?:这个|那个)\s*", "", value)
+        value = re.sub(r"\s*(?:这个|那个)$", "", value)
         if (
             value in intent_catalog.mapping("genre")
             or value in intent_catalog.terms("movie_title_generic")

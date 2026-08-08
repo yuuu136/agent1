@@ -149,6 +149,7 @@ class SpringBootMovieTicketMCP:
                     has_showtimes=True,
                     genre=arguments.get("genre"),
                     keyword=keyword,
+                    date=arguments.get("date"),
                 ),
             )
 
@@ -190,6 +191,7 @@ class SpringBootMovieTicketMCP:
                 recommendation_criteria,
                 genre=arguments.get("genre"),
                 keyword=keyword,
+                date=arguments.get("date"),
             ),
         )
 
@@ -208,7 +210,7 @@ class SpringBootMovieTicketMCP:
                 return ToolResult(
                     tool_name="spring_boot.search_showtimes",
                     data={"showtimes": [], "movies": movies},
-                    message=f"票务数据库中没有找到《{movie_name}》。",
+                    message=f"没有找到《{movie_name}》的相关信息。",
                 )
             movie_id = movie.get("movieId")
         elif not movie_id and arguments.get("genre"):
@@ -221,7 +223,7 @@ class SpringBootMovieTicketMCP:
                 return ToolResult(
                     tool_name="spring_boot.search_showtimes",
                     data={"showtimes": [], "movies": movies},
-                    message=f"票务数据库中没有找到{arguments.get('genre')}类型影片。",
+                    message=f"没有找到{arguments.get('genre')}类型的影片，换个类型试试？",
                 )
 
         date_value = self._spring_date(arguments.get("date"))
@@ -561,7 +563,7 @@ class SpringBootMovieTicketMCP:
             arguments,
             {
                 "page": arguments.get("page", 1),
-                "size": arguments.get("size", 20),
+                "size": 5,
                 "status": arguments.get("status"),
             },
         )
@@ -572,10 +574,10 @@ class SpringBootMovieTicketMCP:
                 "records": [self._format_order(item) for item in records],
                 "total": raw.get("total", len(records)),
                 "page": raw.get("page", arguments.get("page", 1)),
-                "size": raw.get("size", arguments.get("size", 20)),
+                "size": raw.get("size", 5),
                 "source": "spring_boot_database",
             },
-            message=f"已从票务数据库加载 {len(records)} 个订单。",
+            message="目前只展示近期5笔订单，更多订单请查看订单列表。",
         )
 
     def search_nearby_cinemas(self, arguments: dict[str, Any]) -> ToolResult:
@@ -829,6 +831,7 @@ class SpringBootMovieTicketMCP:
             "orderId": raw.get("orderId") or fallback_order_id,
             "status": raw.get("status"),
             "amount": raw.get("amount"),
+            "serviceFee": raw.get("serviceFee"),
             "outRequestNo": raw.get("outRequestNo"),
             "message": raw.get("message"),
             "updatedAt": raw.get("updatedAt"),
@@ -916,6 +919,7 @@ class SpringBootMovieTicketMCP:
         arguments: dict[str, Any],
         keyword: Any = None,
         genre: Any = None,
+        date: Any = None,
     ) -> list[dict[str, Any]]:
         data = self._get_business(
             "/api/agent/movies",
@@ -925,6 +929,7 @@ class SpringBootMovieTicketMCP:
                 "size": arguments.get("size", 10),
                 "keyword": keyword,
                 "genre": genre,
+                "date": date or self._spring_date(arguments.get("date")),
                 "status": arguments.get("status"),
             },
         )
@@ -1087,6 +1092,7 @@ class SpringBootMovieTicketMCP:
                 "startAt": s.get("startAt"),
                 "date": str(s.get("startAt") or "")[:10],
                 "time": str(s.get("startAt") or "")[11:16],
+                "endAt": s.get("endAt"),
                 "price": s.get("price"),
                 "remainingSeats": s.get("remainingSeats"),
             }
@@ -1323,21 +1329,25 @@ class SpringBootMovieTicketMCP:
         has_showtimes: bool = False,
         genre: Any = None,
         keyword: Any = None,
+        date: Any = None,
     ) -> str:
         count = len(movies)
         genre_label = str(genre or "").strip()
         keyword_label = str(keyword or "").strip()
+        date_label = self._display_date(date) if date else ""
 
         if count == 0:
             if genre_label:
-                return f"暂时没有找到{genre_label}类型的影片，要不要换个类型试试？"
+                if date_label:
+                    return f"{date_label}没有{genre_label}类型的排片。要不要换个类型或日期看看？"
+                return f"{genre_label}类型的影片暂时没有排片。要不要看看现在有哪些电影正在上映？"
             if keyword_label:
                 return f"没有找到与「{keyword_label}」相关的影片，换个关键词试试？"
             if cinema_name:
-                return f"{cinema_name}暂时没有正在上映的影片。"
-            return "当前没有正在上映的影片，过几天再来看看吧。"
+                return f"{cinema_name}暂时没有正在上映的影片，看看其他影院？"
+            return "当前没有正在上映的影片。过几天再来看看吧。"
 
-        head = self._movie_search_head(count, genre_label, keyword_label, criteria, cinema_name, has_showtimes)
+        head = self._movie_search_head(count, genre_label, keyword_label, criteria, cinema_name, has_showtimes, date_label)
         detail = self._movie_showtime_lines(movies)
         if detail:
             return f"{head}\n\n{detail}"
@@ -1377,11 +1387,13 @@ class SpringBootMovieTicketMCP:
         criteria: Any,
         cinema_name: str | None,
         has_showtimes: bool,
+        date_label: str = "",
     ) -> str:
+        date_prefix = f"{date_label}" if date_label else ""
         if genre_label:
-            return f"为你找到了 {count} 部{genre_label}片"
+            return f"为你找到了 {count} 部{date_prefix}{genre_label}片"
         if keyword_label:
-            return f"为你找到了 {count} 部与「{keyword_label}」相关的影片"
+            return f"为你找到了 {count} 部与「{keyword_label}」相关的{date_prefix}影片"
         labels = {
             "couple": "适合情侣一起观看的",
             "family": "适合亲子或家庭的",
@@ -1392,10 +1404,12 @@ class SpringBootMovieTicketMCP:
         }
         label = labels.get(str(criteria or "").strip())
         if label:
-            return f"为你找到了 {count} 部{label}影片"
+            return f"为你找到了 {count} 部{label}{date_prefix}影片"
         if cinema_name:
             action = "正在排片" if has_showtimes else "正在上映"
-            return f"{cinema_name}有 {count} 部电影{action}"
+            return f"{cinema_name}有 {count} 部电影{date_prefix}{action}"
+        if date_label:
+            return f"{date_prefix}有 {count} 部电影正在上映"
         return f"当前有 {count} 部电影正在上映"
 
     @staticmethod
@@ -1411,13 +1425,21 @@ class SpringBootMovieTicketMCP:
                 cinema = st.get("cinemaName") or ""
                 hall = st.get("hallName") or ""
                 start = st.get("startAt") or ""
+                end = st.get("endAt") or ""
                 price = st.get("price") or ""
                 price_text = f" {price}元" if price else ""
-                time_text = str(start)[:16].replace("T", " ") if start else ""
+                start_text = str(start)[:16].replace("T", " ") if start else ""
+                end_text = str(end)[:16].replace("T", " ") if end else ""
+                time_text = f"{start_text} - {end_text}" if start_text and end_text else start_text
                 where = f"{cinema} {hall}".strip()
-                parts.append(f"{where} {time_text}{price_text}")
+                parts.append(
+                    " · ".join(
+                        part for part in [where, time_text, price_text.strip()] if part
+                    )
+                )
             if parts:
-                lines.append(f"• 《{name}》" + "；".join(parts))
+                lines.append(f"• 《{name}》")
+                lines.extend(f"  {part}" for part in parts)
         return "\n".join(lines)
 
     def _pick_movie(
@@ -1557,9 +1579,16 @@ class SpringBootMovieTicketMCP:
         if requested_time in {"evening", "晚上"}:
             return value >= "18:00"
         if requested_time in {"afternoon", "下午"}:
-            return "12:00" <= value < "18:00"
+            return "12:00" <= value < "19:00"
         if requested_time in {"morning", "上午"}:
             return value < "12:00"
+        # 用户说“16点”时匹配该小时内的场次，避免把晚上的场次一并返回。
+        match = re.fullmatch(r"(\d{2}):(\d{2})", requested_time)
+        if match:
+            hour, minute = match.groups()
+            if minute == "00":
+                return value.startswith(f"{hour}:")
+            return value == requested_time
         return value >= requested_time
 
     def _should_auto_navigate(
@@ -1583,12 +1612,12 @@ class SpringBootMovieTicketMCP:
         if response_data.get("navigation"):
             return "已匹配到唯一场次，准备进入选座。"
         if showtimes:
-            return f"已在票务数据库中找到 {len(showtimes)} 个符合条件的场次。"
+            return f"为你找到了 {len(showtimes)} 个符合条件的场次。"
 
         constraints = self._showtime_constraints(arguments)
         if constraints:
-            return f"按{constraints}查询，票务数据库中没有符合条件的场次。可以换影院、换时间或换类型。"
-        return "票务数据库中没有符合条件的场次。可以换影院、换时间或换类型。"
+            return f"按{constraints}没有找到合适的场次，可以换影院、换时间或换类型看看。"
+        return "没有找到合适的场次，可以换影院、换时间或换类型看看。"
 
     def _showtime_constraints(self, arguments: dict[str, Any]) -> str:
         parts = []
@@ -1628,11 +1657,18 @@ class SpringBootMovieTicketMCP:
         }.get(text, f"{text}后")
 
     def _showtime_subtitle(self, showtime: dict[str, Any]) -> str:
+        start_at = str(showtime.get("startAt") or "")
+        end_at = str(showtime.get("endAt") or "")
+        start_text = start_at[:16].replace("T", " ") if start_at else ""
+        end_text = end_at[:16].replace("T", " ") if end_at else ""
+        time_text = f"{start_text} - {end_text}" if start_text and end_text else (
+            start_text or end_text or showtime.get("time")
+        )
         parts = [
             showtime.get("movieName"),
             showtime.get("cinemaName"),
-            showtime.get("date"),
-            showtime.get("time"),
+            showtime.get("hallName"),
+            time_text,
         ]
         return " ".join(str(part) for part in parts if part)
 
@@ -1646,6 +1682,11 @@ class SpringBootMovieTicketMCP:
             "cinemaName": cinema_name,
             "address": item.get("address"),
             "district": item.get("district"),
+            "services": (
+                item.get("services")
+                or item.get("serviceTags")
+                or item.get("service")
+            ),
             "location": (
                 f"{longitude},{latitude}"
                 if longitude is not None and latitude is not None
