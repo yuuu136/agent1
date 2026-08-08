@@ -73,17 +73,46 @@ class CardBuilder:
         ]
 
     def showtime_cards(self, showtimes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "showtime",
-                "id": item.get("showtimeId"),
-                "title": item.get("movieName"),
-                "subtitle": f"{item.get('cinemaName')} {item.get('date')} {item.get('time')}",
-                "meta": {"price": item.get("price"), "remainingSeats": item.get("remainingSeats")},
-                "actions": [{"event": "select_showtime", "label": "选择这场", "payload": item}],
+        cards: list[dict[str, Any]] = []
+        for item in showtimes:
+            cinema = item.get("cinema") or {}
+            hall = item.get("hall") or {}
+            start_at = str(item.get("startAt") or "")
+            cinema_name = item.get("cinemaName") or cinema.get("name")
+            hall_name = item.get("hallName") or hall.get("name") or item.get("hallType")
+            date = item.get("date") or start_at[:10]
+            time = item.get("time") or start_at[11:16]
+            end_at = str(item.get("endAt") or "")
+            end_time = item.get("endTime") or end_at[11:16]
+            payload = {
+                **item,
+                "cinemaName": cinema_name,
+                "hallName": hall_name,
+                "date": date,
+                "time": time,
+                "endTime": end_time,
             }
-            for item in showtimes
-        ]
+            subtitle = " · ".join(
+                part for part in [
+                    f"影院：{cinema_name}" if cinema_name else "",
+                    f"影厅：{hall_name}" if hall_name else "",
+                    f"{date} {time}{f' - {end_time}' if end_time else ''}".strip()
+                    if date or time
+                    else "",
+                ] if part
+            )
+            cards.append(
+                {
+                    "type": "showtime",
+                    "id": item.get("showtimeId"),
+                    "title": item.get("movieName"),
+                    "subtitle": subtitle,
+                    "meta": {"price": item.get("price"), "remainingSeats": item.get("remainingSeats")},
+                    "payload": payload,
+                    "actions": [{"event": "select_showtime", "label": "选择这场", "payload": payload}],
+                }
+            )
+        return cards
 
     def navigation_card(self, navigation: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -151,6 +180,9 @@ class CardBuilder:
                 "meta": {
                     "distance": item.get("distance"),
                     "address": item.get("address"),
+                    "district": item.get("district"),
+                    "minPrice": item.get("minPrice"),
+                    "services": item.get("services"),
                     "location": item.get("location"),
                     "tel": item.get("tel"),
                     "type": item.get("type"),
@@ -245,6 +277,7 @@ class CardBuilder:
                     "订单号": data.get("orderId"),
                     "状态": data.get("status"),
                     "金额": self._format_amount(data.get("amount")),
+                    "手续费": self._format_amount(data.get("serviceFee")),
                     "退款请求号": data.get("outRequestNo"),
                     "更新时间": data.get("updatedAt"),
                 },
