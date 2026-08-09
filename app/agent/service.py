@@ -443,6 +443,20 @@ class AgentService:
             state.selected.pop("snack_candidates", None)
             state.pending_action = None
             result.data["seatsReleased"] = True
+            if plan.params.get("cancelFlow"):
+                settings = agent_config.get("agent", {})
+                state.selected.clear()
+                state.slots = {
+                    "city": settings.get("default_city", ""),
+                    "ticketCount": settings.get("default_ticket_count", 2),
+                    "seatPreference": settings.get(
+                        "default_seat_preference",
+                        "middle",
+                    ),
+                }
+                state.state = "idle"
+                result.message = "已取消订单并释放锁定的座位。"
+                return
             self._resume_after_cancel_order(state, plan, result)
             return
 

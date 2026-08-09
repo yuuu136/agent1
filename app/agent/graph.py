@@ -54,6 +54,13 @@ def merge_context_node(data: AgentGraphState) -> dict[str, Any]:
     }
 
 
+def preserve_context_for_reference_node(
+    data: AgentGraphState,
+) -> dict[str, Any]:
+    """Keep the persisted state intact until reference resolution finishes."""
+    return {"state": data["state"]}
+
+
 def reference_node(data: AgentGraphState) -> dict[str, Any]:
     return {
         "nlu": reference_resolver.resolve(data["state"], data["nlu"]),
@@ -118,6 +125,8 @@ def ask_node(data: AgentGraphState) -> dict[str, Any]:
 def _build_ask_message(state: "AgentState", plan: "AgentPlan") -> str:
     """Build a personalized ask message based on what's known and missing."""
     params = plan.params or {}
+    if params.get("message"):
+        return str(params["message"])
     missing = params.get("missing", [])
     filled = params.get("filled", {})
     next_ask = params.get("next_ask", "")
@@ -213,7 +222,10 @@ checkpointer = MemorySaver(
 def build_agent_graph():
     graph = StateGraph(AgentGraphState)
     graph.add_node("nlu", nlu_node)
-    graph.add_node("merge_context_initial", merge_context_node)
+    graph.add_node(
+        "merge_context_initial",
+        preserve_context_for_reference_node,
+    )
     graph.add_node("reference", reference_node)
     graph.add_node("merge_context_after_reference", merge_context_node)
     graph.add_node("planner", planner_node)

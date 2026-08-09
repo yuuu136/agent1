@@ -27,12 +27,22 @@ class ReferenceResolver:
         slots = dict(nlu.slots)
         text = nlu.reference_text or state.last_user_text
 
-        # LLM 已经利用上下文解析出了完整 slot，不再用硬编码覆盖
-        if nlu.intent_source == "llm" and (
+        if self._is_explicit_new_movie_request(state, nlu, slots, text):
+            self._clear_previous_movie_context(slots)
+
+        # LLM 已经利用上下文解析出了完整 slot，不再用硬编码覆盖。
+        # 但“换场”是强上下文操作，必须优先保留当前影片并排除原场次。
+        if (
+            nlu.intent_source == "llm"
+            and not self._is_change_showtime(text)
+            and self._extract_ordinal(text) is None
+            and not any(word in text for word in ["这个", "这场", "这家"])
+            and (
             slots.get("cinemaName")
             or slots.get("movieName")
             or slots.get("movieId")
             or slots.get("showtimeId")
+            )
         ):
             return nlu.model_copy(update={"slots": slots})
 
@@ -101,13 +111,18 @@ class ReferenceResolver:
                 "couponId",
                 "snackIds",
                 "snackItems",
-                "snackRequests",
                 "price",
             )
 
         ordinal = self._extract_ordinal(text)
+        selected_slot: str | None = None
         if ordinal is not None:
-            self._apply_candidate_ordinal(state, slots, ordinal, text)
+            selected_slot = self._apply_candidate_ordinal(
+                state,
+                slots,
+                ordinal,
+                text,
+            )
 
         if any(word in text for word in ["这个", "这场", "这家"]) and state.selected:
             self._apply_current_selection(state, slots, text)
@@ -125,7 +140,11 @@ class ReferenceResolver:
             self._clear_downstream_selection(slots)
 
         intent = nlu.intent
-        if state.pending_action == "ask_time" and self._is_any_time(text):
+        if selected_slot == "showtimeId":
+            intent = "select_showtime"
+        elif selected_slot in {"movieId", "cinemaId"}:
+            intent = "select_or_modify"
+        elif state.pending_action == "ask_time" and self._is_any_time(text):
             slots["timePreference"] = "any"
             self._add_clear_slots(slots, "timeRange")
             slots.pop("timeRange", None)
@@ -155,6 +174,41 @@ class ReferenceResolver:
             "expiresAt",
         )
 
+    def _is_explicit_new_movie_request(
+        self,
+        state: AgentState,
+        nlu: NLUResult,
+        slots: dict[str, Any],
+        text: str,
+    ) -> bool:
+        if nlu.intent not in {"book_ticket", "search_movies", "search_showtimes"}:
+            return False
+        if slots.get("movieId") not in [None, ""]:
+            return False
+        current_name = str(state.slots.get("movieName") or "").strip()
+        requested_name = str(slots.get("movieName") or "").strip()
+        if not current_name or not requested_name or current_name == requested_name:
+            return False
+        return requested_name.replace(" ", "") in text.replace(" ", "")
+
+    def _clear_previous_movie_context(self, slots: dict[str, Any]) -> None:
+        self._add_clear_slots(
+            slots,
+            "movieId",
+            "genre",
+            "date",
+            "timeRange",
+            "timePreference",
+            "pricePreference",
+            "ticketCount",
+            "cinemaId",
+            "cinemaName",
+            "hallType",
+            "showtimeId",
+            "seatIds",
+            "seatPositions",
+        )
+
     def _normalize_ticket_count_change(
         self,
         state: AgentState,
@@ -180,9 +234,12 @@ class ReferenceResolver:
 
     def _is_increment_ticket_count(self, text: str) -> bool:
         normalized = re.sub(r"\s+", "", text)
-        return any(
-            marker in normalized
-            for marker in ["再加", "多加", "增加", "加一", "加两", "加俩", "加2", "加1"]
+        return bool(
+            re.search(
+                r"(?:再加|多加|增加|加)(?:一|两|俩|[1-9]\d*)张"
+                r"(?:电影票|影票|票)?",
+                normalized,
+            )
         )
 
     def _is_decrement_ticket_count(self, text: str) -> bool:
@@ -301,13 +358,7 @@ class ReferenceResolver:
             and "场" in text
         ):
             return True
-        return bool(
-            re.search(
-                r"(?:选|挑|找)(?:择)?(?:个|一个|一场)?"
-                r"[^，。！？,.!?]{0,12}场次",
-                text,
-            )
-        )
+        return False
 
     def _add_clear_slots(self, slots: dict[str, Any], *keys: str) -> None:
         current = slots.get("__clearSlots")
@@ -387,7 +438,7 @@ class ReferenceResolver:
         slots: dict[str, Any],
         ordinal: int,
         text: str,
-    ) -> None:
+    ) -> str | None:
         index = ordinal - 1
         candidates = (
             ("movie_candidates", "movieId"),
@@ -427,7 +478,8 @@ class ReferenceResolver:
             ):
                 if item.get(key) is not None:
                     slots[key] = item[key]
-            return
+            return slot_key
+        return None
 
     def _apply_current_selection(
         self,
@@ -490,7 +542,6 @@ class ReferenceResolver:
                 "couponId",
                 "snackIds",
                 "snackItems",
-                "snackRequests",
                 "price",
             )
         elif slot_key == "cinemaId":
@@ -504,7 +555,6 @@ class ReferenceResolver:
                 "couponId",
                 "snackIds",
                 "snackItems",
-                "snackRequests",
                 "price",
             )
         elif slot_key == "showtimeId":

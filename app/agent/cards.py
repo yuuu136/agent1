@@ -56,11 +56,15 @@ class CardBuilder:
                 "posterUrl": item.get("posterUrl") or item.get("poster") or item.get("image"),
                 "meta": {
                     "类型：": item.get("genre"),
-                    "评分：": item.get("score"),
                     "时长：": self._format_duration(item.get("durationMinutes")),
                     "状态：": item.get("status"),
+                    **(
+                        {"评分：": item.get("score")}
+                        if self._has_valid_score(item.get("score"))
+                        else {}
+                    ),
                 },
-                "payload": item,
+                "payload": self._movie_payload(item),
                 "actions": [
                     {
                         "event": "select_movie",
@@ -71,6 +75,20 @@ class CardBuilder:
             }
             for item in movies
         ]
+
+    @staticmethod
+    def _has_valid_score(value: Any) -> bool:
+        try:
+            return float(value) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _movie_payload(self, item: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(item)
+        if not self._has_valid_score(payload.get("score")):
+            payload.pop("score", None)
+            payload.pop("rating", None)
+        return payload
 
     def showtime_cards(self, showtimes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cards: list[dict[str, Any]] = []
@@ -95,6 +113,7 @@ class CardBuilder:
             subtitle = " · ".join(
                 part for part in [
                     f"影院：{cinema_name}" if cinema_name else "",
+                    self._distance_text(item.get("distance")),
                     f"影厅：{hall_name}" if hall_name else "",
                     f"{date} {time}{f' - {end_time}' if end_time else ''}".strip()
                     if date or time
@@ -107,12 +126,28 @@ class CardBuilder:
                     "id": item.get("showtimeId"),
                     "title": item.get("movieName"),
                     "subtitle": subtitle,
-                    "meta": {"price": item.get("price"), "remainingSeats": item.get("remainingSeats")},
+                    "meta": {
+                        "price": item.get("price"),
+                        "remainingSeats": item.get("remainingSeats"),
+                        "distance": item.get("distance"),
+                    },
                     "payload": payload,
                     "actions": [{"event": "select_showtime", "label": "选择这场", "payload": payload}],
                 }
             )
         return cards
+
+    @staticmethod
+    def _distance_text(value: Any) -> str:
+        try:
+            distance = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if distance < 0:
+            return ""
+        if distance < 1:
+            return f"距离：{distance * 1000:.0f}米"
+        return f"距离：{distance:.1f}公里"
 
     def navigation_card(self, navigation: dict[str, Any]) -> dict[str, Any]:
         return {
