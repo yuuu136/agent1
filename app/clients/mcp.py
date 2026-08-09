@@ -77,6 +77,7 @@ class SpringBootMovieTicketMCP:
             )
 
     def search_movies(self, arguments: dict[str, Any]) -> ToolResult:
+        arguments = self._with_resolved_cinema_id(arguments)
         keyword = arguments.get("movieName") or arguments.get("keyword")
         cinema_id = arguments.get("cinemaId")
         recommendation_criteria = arguments.get("recommendationCriteria")
@@ -221,6 +222,7 @@ class SpringBootMovieTicketMCP:
         )
 
     def search_showtimes(self, arguments: dict[str, Any]) -> ToolResult:
+        arguments = self._with_resolved_cinema_id(arguments)
         movie_id = arguments.get("movieId")
         movie_name = str(arguments.get("movieName") or "").strip()
         movie_ids: list[Any] = []
@@ -232,6 +234,13 @@ class SpringBootMovieTicketMCP:
             movies = movie_result.data.get("movies", [])
             movie = self._pick_movie(movies, movie_name)
             if not movie:
+                cinema_showtimes = self._load_matching_showtimes_without_movie_id(
+                    arguments,
+                    movie_name,
+                    self._spring_date(arguments.get("date")),
+                )
+                if cinema_showtimes:
+                    return self._showtime_result(arguments, cinema_showtimes)
                 return ToolResult(
                     tool_name="spring_boot.search_showtimes",
                     data={"showtimes": [], "movies": movies},
@@ -287,6 +296,18 @@ class SpringBootMovieTicketMCP:
                 "subtitle": self._showtime_subtitle(showtime),
                 "label": "进入选座",
             }
+        return self._showtime_result(arguments, showtimes, response_data)
+
+    def _showtime_result(
+        self,
+        arguments: dict[str, Any],
+        showtimes: list[dict[str, Any]],
+        response_data: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        response_data = response_data or {
+            "showtimes": showtimes,
+            "source": "spring_boot_database",
+        }
         return ToolResult(
             tool_name="spring_boot.search_showtimes",
             data=response_data,
@@ -297,6 +318,74 @@ class SpringBootMovieTicketMCP:
                 else []
             ),
         )
+
+    def _load_matching_showtimes_without_movie_id(
+        self,
+        arguments: dict[str, Any],
+        movie_name: str,
+        date_value: str | None,
+    ) -> list[dict[str, Any]]:
+        if arguments.get("cinemaId") in [None, ""]:
+            return []
+        showtimes = self._load_showtimes_without_movie_id(arguments, date_value)
+        normalized_name = self._normalize_match_text(movie_name)
+        if normalized_name:
+            showtimes = [
+                item
+                for item in showtimes
+                if normalized_name in self._normalize_match_text(item.get("movieName"))
+                or self._normalize_match_text(item.get("movieName")) in normalized_name
+            ]
+        return self._filter_showtimes(
+            showtimes,
+            date_value,
+            arguments.get("timeRange"),
+            arguments.get("ticketCount"),
+            arguments.get("pricePreference"),
+            arguments.get("timePreference"),
+            arguments.get("excludeShowtimeId"),
+        )
+
+    def _load_showtimes_without_movie_id(
+        self,
+        arguments: dict[str, Any],
+        date_value: str | None,
+    ) -> list[dict[str, Any]]:
+        if date_value is not None:
+            data = self._get_business(
+                "/api/user/showtimes",
+                arguments,
+                {
+                    "cinemaId": arguments.get("cinemaId"),
+                    "date": date_value,
+                    "hallType": arguments.get("hallType"),
+                },
+            )
+            return self._format_showtime_groups(data)
+
+        days = self._positive_int(arguments.get("lookaheadDays")) or 7
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        combined: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for offset in range(days):
+            day = (today + timedelta(days=offset)).isoformat()
+            data = self._get_business(
+                "/api/user/showtimes",
+                arguments,
+                {
+                    "cinemaId": arguments.get("cinemaId"),
+                    "date": day,
+                    "hallType": arguments.get("hallType"),
+                },
+            )
+            for showtime in self._format_showtime_groups(data):
+                key = str(showtime.get("showtimeId") or "")
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                combined.append(showtime)
+        return combined
 
     def _search_showtimes_by_preference(
         self,
@@ -1040,6 +1129,48 @@ class SpringBootMovieTicketMCP:
             message = payload.get("msg") or payload.get("message") or "票务服务查询失败。"
             raise ValueError(message)
         return payload.get("data") or {}
+
+    def _with_resolved_cinema_id(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if arguments.get("cinemaId") not in [None, ""]:
+            return arguments
+        cinema_name = str(arguments.get("cinemaName") or "").strip()
+        if not cinema_name:
+            return arguments
+        cinema = self._resolve_cinema_by_name(arguments, cinema_name)
+        if not cinema or cinema.get("cinemaId") in [None, ""]:
+            return arguments
+        resolved = dict(arguments)
+        resolved["cinemaId"] = cinema.get("cinemaId")
+        resolved["cinemaName"] = cinema.get("cinemaName") or cinema_name
+        return resolved
+
+    def _resolve_cinema_by_name(
+        self,
+        arguments: dict[str, Any],
+        cinema_name: str,
+    ) -> dict[str, Any] | None:
+        try:
+            data = self._get_business(
+                "/api/user/cinemas",
+                arguments,
+                {"page": 1, "size": 20, "keyword": cinema_name},
+            )
+        except Exception:
+            return None
+
+        records = [self._format_cinema(item) for item in data.get("records") or []]
+        if not records:
+            return None
+
+        target = self._normalize_match_text(cinema_name)
+        for item in records:
+            if self._normalize_match_text(item.get("cinemaName")) == target:
+                return item
+        for item in records:
+            actual = self._normalize_match_text(item.get("cinemaName"))
+            if target in actual or actual in target:
+                return item
+        return records[0]
 
     def _post_business(
         self,

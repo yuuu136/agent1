@@ -88,6 +88,32 @@ def is_skip_snacks_text(text: str) -> bool:
     )
 
 
+def is_capability_question_text(text: str) -> bool:
+    normalized = _normalize_short_text(text)
+    if not any(marker in normalized for marker in ["电影票", "影票", "订票", "买票"]):
+        return False
+    return any(
+        phrase in normalized
+        for phrase in [
+            "可以帮我买",
+            "能帮我买",
+            "能不能帮我买",
+            "可不可以帮我买",
+            "可以帮我订",
+            "能帮我订",
+            "能不能帮我订",
+            "可不可以帮我订",
+            "会买电影票",
+            "能买电影票",
+            "可以买电影票",
+            "能订电影票",
+            "可以订电影票",
+            "支持买电影票",
+            "支持订电影票",
+        ]
+    )
+
+
 def _build_llm_client() -> OpenAI:
     llm = agent_config.get("llm", {})
     api_key = os.getenv(llm.get("api_key_env", "DASHSCOPE_API_KEY"))
@@ -134,6 +160,13 @@ class LLMNLU:
                 return NLUResult(intent="smalltalk", confidence=0.95, intent_source="rule")
             if is_ack_text(text):
                 return NLUResult(intent="smalltalk", confidence=0.85, intent_source="rule")
+            if is_capability_question_text(text):
+                return NLUResult(
+                    intent="smalltalk",
+                    confidence=0.95,
+                    intent_source="rule",
+                    reference_text=text,
+                )
             if is_cancel_text(text):
                 return NLUResult(intent="cancel", confidence=0.95, intent_source="rule")
             if is_skip_snacks_text(text):
@@ -185,7 +218,10 @@ class LLMNLU:
             if self._is_showtime_search_text(text):
                 slots = self._extract_booking_slots(text, payload)
                 self._apply_nearby_showtime_preferences(text, slots)
-                movie_name = self._extract_showtime_query_movie_name(text)
+                movie_name = self._extract_showtime_query_movie_name(
+                    text,
+                    str(slots.get("cinemaName") or ""),
+                )
                 if movie_name:
                     slots["movieName"] = movie_name
                 if self._should_clear_stale_showtime_constraints(text):
@@ -1187,9 +1223,14 @@ class LLMNLU:
             slots.setdefault("date", "today")
         return slots
 
-    @staticmethod
-    def _extract_showtime_query_movie_name(text: str) -> str:
+    def _extract_showtime_query_movie_name(
+        self,
+        text: str,
+        cinema_name: str | None = None,
+    ) -> str:
         normalized = re.sub(r"\s+", "", text)
+        if cinema_name:
+            normalized = normalized.replace(cinema_name, "")
         quoted = re.search(r"[《【](?P<name>[^》】]+)[》】]", normalized)
         if quoted:
             return quoted.group("name").strip()
@@ -1263,7 +1304,11 @@ class LLMNLU:
             "",
             candidate,
         )
+        candidate = re.sub(r"(?:有哪些|有什么|有)$", "", candidate)
         candidate = re.sub(r"(?:最近|最早|一场|的)+$", "", candidate)
+        candidate = self._clean_movie_candidate(candidate)
+        if cinema_name:
+            candidate = self._clean_movie_candidate(candidate.replace(cinema_name, ""))
         candidate = candidate.strip("的《》【】,，。！？!? ")
         if candidate in {"", "电影", "影片", "场次", "最近", "附近"}:
             return ""
