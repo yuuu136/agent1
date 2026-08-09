@@ -162,6 +162,21 @@ class TaskPlanner:
             )
 
         if nlu.intent == "search_showtimes":
+            if (
+                slots.get("nearbyFirst")
+                and slots.get("cinemaId") in [None, ""]
+                and slots.get("location") in [None, ""]
+            ):
+                return AgentPlan(
+                    action="ask",
+                    reason="按最近影院查询需要当前位置",
+                    params={
+                        "message": "需要先获取你的经纬度位置，才能按最近影院帮你找场次。请允许定位后再试一次。",
+                        "missing": ["location"],
+                        "next_ask": "location",
+                    },
+                    state="collecting_location",
+                )
             return AgentPlan(
                 action="search_showtimes",
                 reason="用户请求查看指定影片的场次",
@@ -395,6 +410,39 @@ class TaskPlanner:
             return AgentPlan(action="get_seats",
                 params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference", "seatPositions"]),
                 state="selecting_seats")
+
+        if (
+            nlu.intent == "select_or_modify"
+            and slots.get("movieId")
+            and (
+                "movieId" in nlu.slots
+                or state.state == "selecting_movie"
+                or state.pending_action == "search_movies"
+            )
+        ):
+            return AgentPlan(
+                action="search_showtimes",
+                reason="用户已选择影片，直接查询该影片场次",
+                params=self._pick(
+                    slots,
+                    [
+                        "movieId",
+                        "movieName",
+                        "genre",
+                        "date",
+                        "timeRange",
+                        "ticketCount",
+                        "cinemaId",
+                        "cinemaName",
+                        "hallType",
+                        "notHallType",
+                        "maxPrice",
+                        "pricePreference",
+                        "timePreference",
+                    ],
+                ),
+                state="selecting_showtime",
+            )
 
         # ── Booking flow: use DST to decide ──
         if nlu.intent in ("book_ticket", "select_or_modify"):

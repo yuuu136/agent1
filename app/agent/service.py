@@ -507,28 +507,35 @@ class AgentService:
 
         if plan.action == "search_movies":
             state.selected.pop("movie_candidates", None)
+            state.selected.pop("showtime_candidates", None)
             # When search returns results with showtimes AND the user is asking
             # about a specific movie (not browsing), auto-fill date+time so
             # the user sees actual showtimes instead of being asked step by step.
             movies = data.get("movies") or []
             if isinstance(movies, list) and movies:
                 want_specific = plan.params.get("movieName") or plan.params.get("keyword")
-                if want_specific or plan.params.get("movieLimit") == 1:
-                    for movie in movies:
-                        showtimes = movie.get("upcomingShowtimes") or []
-                        if showtimes:
-                            dates = sorted({
-                                str(st.get("startAt", ""))[:10]
-                                for st in showtimes if st.get("startAt")
-                            })
-                            if dates:
-                                data["date"] = dates[0]
-                                # Pre-fill so DST doesn't re-ask date/time.
-                                # User picks from the actual showtime cards.
-                                data["timePreference"] = "any"
-                            if not data.get("movieName"):
-                                data["movieName"] = movie.get("movieName")
-                            break
+                if (want_specific or plan.params.get("movieLimit") == 1) and len(movies) == 1:
+                    movie = movies[0]
+                    showtimes = movie.get("upcomingShowtimes") or []
+                    if showtimes:
+                        data["directShowtimes"] = True
+                        data["showtimes"] = showtimes
+                        data["movieId"] = movie.get("movieId")
+                        data["movieName"] = movie.get("movieName")
+                        dates = sorted({
+                            str(st.get("startAt", ""))[:10]
+                            for st in showtimes if st.get("startAt")
+                        })
+                        if dates:
+                            data["date"] = dates[0]
+                            data["timePreference"] = "any"
+                        state.state = "selecting_showtime"
+                        state.pending_action = "search_showtimes"
+                        result.message = (
+                            f"已找到《{movie.get('movieName') or '这部电影'}》，"
+                            "下面是可选场次，选择一场后就可以选座。"
+                        )
+                        result.suggestions = ["换个时间", "附近影院", "换一部电影"]
         if plan.action == "search_showtimes":
             state.selected.pop("showtime_candidates", None)
             state.selected.pop("order", None)

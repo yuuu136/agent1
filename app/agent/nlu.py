@@ -2,15 +2,22 @@
 LLM-powered intent + slot extraction for everything else."""
 
 import json
+import logging
 import os
 import re
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from openai import OpenAI
 
+from app.agent.intent_rag import IntentMatch, IntentRAGUnavailable, get_intent_rag_retriever
 from app.prompts import prompt_manager
 from app.schemas.agent import AgentState, ChatRequest, NLUResult
 from app.utils.config_handler import agent_config
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_short_text(text: str) -> str:
@@ -53,6 +60,32 @@ def is_cancel_text(text: str) -> bool:
     cancel_contains = ["先不支付", "暂时不支付", "不想支付", "取消支付",
                        "不付了", "不想要了", "不想买了", "不看了", "我不要了", "算了吧"]
     return any(phrase in normalized for phrase in cancel_contains)
+
+
+def is_skip_snacks_text(text: str) -> bool:
+    normalized = _normalize_short_text(text)
+    return any(
+        phrase in normalized
+        for phrase in [
+            "不要零食",
+            "不需要零食",
+            "不用零食",
+            "不吃零食",
+            "不加零食",
+            "不买零食",
+            "零食不要",
+            "零食不要了",
+            "不要爆米花",
+            "不需要爆米花",
+            "不加爆米花",
+            "不买爆米花",
+            "不要饮料",
+            "不买饮料",
+            "不要套餐",
+            "不加套餐",
+            "不需要小吃",
+        ]
+    )
 
 
 def _build_llm_client() -> OpenAI:
@@ -103,6 +136,13 @@ class LLMNLU:
                 return NLUResult(intent="smalltalk", confidence=0.85, intent_source="rule")
             if is_cancel_text(text):
                 return NLUResult(intent="cancel", confidence=0.95, intent_source="rule")
+            if is_skip_snacks_text(text):
+                return NLUResult(
+                    intent="skip_snacks",
+                    confidence=0.95,
+                    intent_source="rule",
+                    reference_text=text,
+                )
             if self._is_price_query_text(text):
                 return NLUResult(intent="price_query", confidence=0.95, intent_source="rule")
             if self._is_nearby_cinema_text(text):
@@ -117,6 +157,13 @@ class LLMNLU:
                     intent_source="rule",
                     slots=slots,
                 )
+            if self._is_movie_knowledge_question(text):
+                return NLUResult(
+                    intent="smalltalk",
+                    confidence=0.90,
+                    intent_source="llm",
+                    reference_text=text,
+                )
             actor = self._extract_actor_movie_query(text)
             if actor:
                 return NLUResult(
@@ -126,12 +173,42 @@ class LLMNLU:
                     slots={"actor": actor},
                     reference_text=text,
                 )
+            recommendation_slots = self._extract_recommendation_slots(text)
+            if recommendation_slots:
+                return NLUResult(
+                    intent="search_movies",
+                    confidence=0.95,
+                    intent_source="rule",
+                    slots=recommendation_slots,
+                    reference_text=text,
+                )
             if self._is_showtime_search_text(text):
                 slots = self._extract_booking_slots(text, payload)
                 self._apply_nearby_showtime_preferences(text, slots)
                 movie_name = self._extract_showtime_query_movie_name(text)
                 if movie_name:
                     slots["movieName"] = movie_name
+                if self._should_clear_stale_showtime_constraints(text):
+                    slots["__clearSlots"] = [
+                        "date",
+                        "time",
+                        "timeRange",
+                        "timePreference",
+                        "ticketCount",
+                        "showtimeId",
+                        "seatIds",
+                        "seatPositions",
+                        "orderId",
+                        "lockId",
+                        "couponId",
+                        "snackIds",
+                        "snackItems",
+                        "snackRequests",
+                        "price",
+                        "amount",
+                        "status",
+                        "expiresAt",
+                    ]
                 return NLUResult(
                     intent="search_showtimes",
                     confidence=0.95,
@@ -144,6 +221,7 @@ class LLMNLU:
                 movie_names = self._extract_multi_movie_names(text)
                 if len(movie_names) > 1:
                     slots["movieNames"] = movie_names
+                    slots.pop("movieName", None)
                     return NLUResult(
                         intent="multi_movie_booking",
                         confidence=0.95,
@@ -155,6 +233,15 @@ class LLMNLU:
                     confidence=0.92,
                     intent_source="rule",
                     slots=slots,
+                )
+            snack_requests = self._extract_snack_requests(text)
+            if snack_requests:
+                return NLUResult(
+                    intent="snack",
+                    confidence=0.92,
+                    intent_source="rule",
+                    slots={"snackRequests": snack_requests},
+                    reference_text=text,
                 )
 
         # ── payload-driven intents: event-based ──
@@ -204,8 +291,25 @@ class LLMNLU:
             if slot_fill is not None:
                 return slot_fill
 
+        # ── Intent RAG path: semantic examples participate before the LLM ──
+        rag_match: IntentMatch | None = None
+        rag_error: str | None = None
+        if request.event is None and text.strip():
+            try:
+                rag_match = get_intent_rag_retriever().retrieve(text)
+            except IntentRAGUnavailable as exc:
+                rag_error = str(exc)
+                logger.warning("Intent RAG unavailable for NLU: %s", exc)
+            except Exception as exc:
+                rag_error = str(exc)
+                logger.exception("Intent RAG failed unexpectedly")
+
+            rag_result = self._result_from_rag_match(text, payload, rag_match)
+            if rag_result is not None:
+                return rag_result
+
         # ── LLM path ──
-        return self._llm_extract(text, payload, state)
+        return self._llm_extract(text, payload, state, rag_match, rag_error)
 
     @staticmethod
     def _try_fill_pending_slot(text: str, state: "AgentState") -> NLUResult | None:
@@ -272,11 +376,17 @@ class LLMNLU:
 
         return None
 
-    def _llm_extract(self, text: str, payload: dict[str, Any],
-                      state: AgentState | None = None) -> NLUResult:
+    def _llm_extract(
+        self,
+        text: str,
+        payload: dict[str, Any],
+        state: AgentState | None = None,
+        rag_match: IntentMatch | None = None,
+        rag_error: str | None = None,
+    ) -> NLUResult:
         client = _llm_client()
         if client is None:
-            return NLUResult(intent="smalltalk", confidence=0.30, intent_source="rule")
+            return NLUResult(intent="smalltalk", confidence=0.10, intent_source="llm")
 
         nlu_settings = agent_config.get("nlu", {})
         llm_settings = agent_config.get("llm", {})
@@ -288,6 +398,14 @@ class LLMNLU:
         context = self._build_context(state)
         if context:
             user_message += f"\n\n当前会话上下文：{context}"
+        if rag_match is not None:
+            user_message += (
+                "\n\n意图RAG候选："
+                f"intent={rag_match.intent}, score={rag_match.score:.3f}, "
+                f"example={rag_match.example}"
+            )
+        elif rag_error:
+            user_message += f"\n\n意图RAG状态：检索失败，原因：{rag_error}"
 
         try:
             response = client.chat.completions.create(
@@ -301,7 +419,12 @@ class LLMNLU:
                 ],
             )
             parsed = json.loads((response.choices[0].message.content or "").strip())
-        except Exception:
+        except Exception as exc:
+            logger.warning("LLM NLU unavailable: %s", exc)
+            if rag_match is not None:
+                rag_result = self._result_from_rag_match(text, payload, rag_match)
+                if rag_result is not None:
+                    return rag_result
             if self._is_booking_request_text(text):
                 return NLUResult(
                     intent="book_ticket",
@@ -310,7 +433,13 @@ class LLMNLU:
                     slots=self._extract_booking_slots(text, payload),
                     reference_text=text,
                 )
-            return NLUResult(intent="smalltalk", confidence=0.30, intent_source="rule")
+            return NLUResult(
+                intent="smalltalk",
+                confidence=0.10,
+                intent_source="llm",
+                slots={"nluError": str(exc)},
+                reference_text=text,
+            )
 
         intent = str(parsed.get("intent") or "smalltalk")
         llm_slots: dict[str, Any] = parsed.get("slots") or {}
@@ -349,6 +478,61 @@ class LLMNLU:
             reference_text=str(parsed.get("reference") or text),
         )
 
+    def _result_from_rag_match(
+        self,
+        text: str,
+        payload: dict[str, Any],
+        match: IntentMatch | None,
+    ) -> NLUResult | None:
+        if match is None:
+            return None
+        slots = self._slots_for_rag_intent(match.intent, text, payload)
+        confidence = min(0.96, max(0.70, match.score))
+        return NLUResult(
+            intent=match.intent,
+            confidence=confidence,
+            intent_source="rag",
+            rag_score=match.score,
+            rag_example=match.example,
+            slots=slots,
+            is_modification=match.intent == "select_or_modify",
+            reference_text=text,
+        )
+
+    def _slots_for_rag_intent(
+        self,
+        intent: str,
+        text: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if intent == "book_ticket":
+            return self._extract_booking_slots(text, payload)
+        if intent == "search_movies":
+            slots = self._extract_recommendation_slots(text)
+            actor = self._extract_actor_movie_query(text)
+            if actor:
+                slots["actor"] = actor
+            movie_name = self._extract_movie_search_keyword(text)
+            if movie_name and not slots.get("genre") and not slots.get("actor"):
+                slots["movieName"] = movie_name
+            return slots
+        if intent == "nearby_cinema":
+            slots = dict(payload.get("slots", {}) or {})
+            if payload.get("location") not in [None, ""]:
+                slots["location"] = payload.get("location")
+            if payload.get("city") not in [None, ""]:
+                slots["city"] = payload.get("city")
+            return slots
+        if intent == "location_query":
+            slots = {}
+            if payload.get("location") not in [None, ""]:
+                slots["location"] = payload.get("location")
+            return slots
+        if intent == "snack":
+            snack_requests = self._extract_snack_requests(text)
+            return {"snackRequests": snack_requests} if snack_requests else {}
+        return {}
+
     def _extract_booking_slots(
         self,
         text: str,
@@ -382,7 +566,11 @@ class LLMNLU:
         if snack_requests:
             slots["snackRequests"] = snack_requests
 
-        movie_name = self._extract_movie_name(text, snack_requests)
+        cinema_name = self._extract_cinema_name(text)
+        if cinema_name:
+            slots["cinemaName"] = cinema_name
+
+        movie_name = self._extract_movie_name(text, snack_requests, cinema_name)
         if movie_name:
             slots["movieName"] = movie_name
 
@@ -423,6 +611,9 @@ class LLMNLU:
         return count if count and count > 0 else None
 
     def _extract_date(self, text: str) -> str | None:
+        explicit_date = self._extract_explicit_month_day(text)
+        if explicit_date:
+            return explicit_date
         if "后天" in text:
             return "after_tomorrow"
         if "明天" in text or "明晚" in text:
@@ -432,6 +623,31 @@ class LLMNLU:
         if "周末" in text:
             return "weekend"
         return None
+
+    def _extract_explicit_month_day(self, text: str) -> str | None:
+        normalized = re.sub(r"\s+", "", text)
+        match = re.search(
+            r"(?P<month>\d{1,2}|[一二两三四五六七八九十]{1,3})月"
+            r"(?P<day>\d{1,2}|[一二两三四五六七八九十]{1,3})(?:号|日)?",
+            normalized,
+        )
+        if not match:
+            return None
+        month = self._parse_number_token(match.group("month"))
+        day = self._parse_number_token(match.group("day"))
+        if month is None or day is None:
+            return None
+        now = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        try:
+            parsed = date(now.year, month, day)
+        except ValueError:
+            return None
+        if parsed < now:
+            try:
+                parsed = date(now.year + 1, month, day)
+            except ValueError:
+                return None
+        return parsed.isoformat()
 
     def _extract_time_range(self, text: str) -> str | None:
         normalized = re.sub(r"\s+", "", text)
@@ -465,6 +681,29 @@ class LLMNLU:
                 return genre
         return None
 
+    def _should_clear_stale_showtime_constraints(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        if not any(
+            marker in normalized
+            for marker in [
+                "场次",
+                "有哪些场",
+                "有什么场",
+                "放映时间",
+                "几点能看",
+                "什么时候能看",
+                "什么时候有",
+            ]
+        ):
+            return False
+        if self._extract_date(text):
+            return False
+        if self._extract_time_range(text):
+            return False
+        if self._extract_ticket_count(text) is not None:
+            return False
+        return True
+
     def _extract_snack_requests(self, text: str) -> list[dict[str, Any]]:
         normalized = re.sub(r"\s+", "", text)
         snack_names = r"爆米花|可乐|薯条|热狗|饮料|套餐"
@@ -474,10 +713,16 @@ class LLMNLU:
             rf"(?:桶|瓶|杯|份|个|盒)?(?:{snack_names}))",
             normalized,
         )
-        if not connector:
-            return []
-
-        tail = normalized[connector.end():]
+        if connector:
+            tail = normalized[connector.end():]
+        else:
+            if not re.search(snack_names, normalized):
+                return []
+            tail = re.sub(
+                r"^(?:我要|我想要|想要|要|买|来|给我|帮我买|加|再加|再来)+",
+                "",
+                normalized,
+            )
         pattern = re.compile(
             rf"(?P<quantity>[0-9一二两三四五六七八九十]+)?"
             rf"(?P<unit>桶|瓶|杯|份|个|盒)?"
@@ -499,8 +744,11 @@ class LLMNLU:
         self,
         text: str,
         snack_requests: list[dict[str, Any]] | None = None,
+        cinema_name: str | None = None,
     ) -> str:
         cleaned = re.sub(r"\s+", "", text)
+        if cinema_name:
+            cleaned = cleaned.replace(cinema_name, "")
         if snack_requests:
             snack_names = r"爆米花|可乐|薯条|热狗|饮料|套餐"
             cleaned = re.sub(
@@ -515,6 +763,25 @@ class LLMNLU:
             "",
             cleaned,
         )
+        marker_match = re.search(r"(?P<name>.+?)(?:电影票|影票)", cleaned)
+        if marker_match:
+            candidate = self._clean_movie_candidate(marker_match.group("name"))
+            if cinema_name:
+                candidate = self._clean_movie_candidate(candidate.replace(cinema_name, ""))
+            if candidate:
+                return candidate
+
+        cleaned = re.split(
+            r"(?:，|,|。|；|;)?(?:\d{1,2}|[一二两三四五六七八九十]{1,3})月"
+            r"(?:\d{1,2}|[一二两三四五六七八九十]{1,3})(?:号|日)?",
+            cleaned,
+            maxsplit=1,
+        )[0]
+        cleaned = re.split(
+            r"(?:CGV|万达|奥斯卡|影院|影城|电影院|IMAX厅|MAX厅|数字厅)",
+            cleaned,
+            maxsplit=1,
+        )[0]
         cleaned = re.sub(r"[0-9一二两三四五六七八九十]+张(?:电影票|影票|票)?", "", cleaned)
         cleaned = re.sub(r"(今天|今晚|明天|明晚|后天|周末)", "", cleaned)
         cleaned = re.sub(
@@ -522,16 +789,126 @@ class LLMNLU:
             "",
             cleaned,
         )
+        cleaned = self._clean_movie_candidate(cleaned)
+        if cleaned in {"", "片", "部片", "一部片", "喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}:
+            return ""
+        return cleaned
+
+    def _extract_cinema_name(self, text: str) -> str:
+        normalized = re.sub(r"\s+", "", text)
+        suffix = r"(?:电影院|影城|影院)"
+        branch = r"(?:[（(][^）)]{1,20}[）)])?"
+        known_brands = (
+            "CGV|万达|大地|奥斯卡|博纳|金逸|中影|横店|UME|卢米埃|"
+            "保利|橙天嘉禾|星美|幸福蓝海"
+        )
+        patterns = (
+            re.compile(
+                rf"(?P<name>(?:{known_brands})"
+                rf"[A-Za-z0-9\u4e00-\u9fff·_-]{{0,12}}{suffix}{branch})(?:的)?",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"(?P<name>[A-Za-z0-9\u4e00-\u9fff·_-]{{1,30}}{suffix}{branch})(?:的)?"
+            ),
+        )
+        generic_terms = {
+            "影院",
+            "影城",
+            "电影院",
+            "附近影院",
+            "附近影城",
+            "附近电影院",
+            "最近影院",
+            "最近影城",
+            "最近电影院",
+            "最近的影院",
+            "最近的影城",
+            "最近的电影院",
+            "当前影院",
+            "这个影院",
+            "那家影院",
+        }
+        for pattern in patterns:
+            for match in pattern.finditer(normalized):
+                candidate = self._clean_cinema_candidate(match.group("name"))
+                if not candidate or candidate in generic_terms:
+                    continue
+                if any(marker in candidate for marker in ["附近", "最近", "周边", "当前", "这个", "那家"]):
+                    continue
+                return candidate
+        return ""
+
+    def _clean_cinema_candidate(self, value: str) -> str:
+        cleaned = re.sub(r"\s+", "", str(value or ""))
+        cleaned = re.sub(r"^[0-9一二两三四五六七八九十]+张(?:电影票|影票|票)?", "", cleaned)
         cleaned = re.sub(
-            r"^(给我|帮我|我要|我想|想要|请帮我|麻烦帮我|买|订|预订|来|看|想看|去看)+",
+            r"(?:\d{1,2}|[一二两三四五六七八九十]{1,3})月"
+            r"(?:\d{1,2}|[一二两三四五六七八九十]{1,3})(?:号|日)?",
             "",
             cleaned,
         )
+        cleaned = re.sub(r"(今天|今晚|明天|明晚|后天|周末)", "", cleaned)
+        cleaned = re.sub(r"(上午|早上|中午|下午|晚上)的?", "", cleaned)
+        cleaned = re.sub(
+            r"(上午|早上|中午|下午|晚上)?[0-9一二两三四五六七八九十]{1,3}[:：点][0-9一二两三四五六七八九十]{0,2}(?:半)?(?:左右|前后|以后|之后|之前|前)?的?",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"^(给我|帮我|我要|我想|想要|请帮我|麻烦帮我|买|订|预订|来|看|想看|去看)+", "", cleaned)
+        cleaned = cleaned.strip("的《》<>【】[]，,。.!?！？：:")
+        return cleaned
+
+    def _extract_movie_search_keyword(self, text: str) -> str:
+        normalized = re.sub(r"\s+", "", text)
+        quoted = re.search(r"[《【](?P<name>[^》】]+)[》】]", normalized)
+        if quoted:
+            return quoted.group("name").strip()
+
+        candidate = normalized
+        candidate = re.sub(r"^(我想|想|我要|要|帮我|给我|请|麻烦)?(?:看|找|查|搜索|有没有|有无|有)?", "", candidate)
+        candidate = re.sub(r"(?:电影|影片|片子|片)(?:吗|么|嘛|呀|啊)?$", "", candidate)
+        candidate = re.sub(r"(?:有没有|有无|有|哪些|什么|推荐|最近|热映|上映|正在上映)", "", candidate)
+        candidate = self._clean_movie_candidate(candidate)
+        if candidate in {
+            "",
+            "电影",
+            "影片",
+            "片",
+            "片子",
+            "高分",
+            "热门",
+            "热映",
+            "推荐",
+        }:
+            return ""
+        return candidate
+
+    def _clean_movie_candidate(self, value: str) -> str:
+        cleaned = re.sub(r"\s+", "", str(value or ""))
+        cleaned = re.sub(r"[0-9一二两三四五六七八九十]+张(?:电影票|影票|票)?", "", cleaned)
+        cleaned = re.sub(
+            r"(?:\d{1,2}|[一二两三四五六七八九十]{1,3})月"
+            r"(?:\d{1,2}|[一二两三四五六七八九十]{1,3})(?:号|日)?",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"(今天|今晚|明天|明晚|后天|周末)", "", cleaned)
+        cleaned = re.sub(
+            r"(上午|早上|中午|下午|晚上)?[0-9一二两三四五六七八九十]{1,3}[:：点][0-9一二两三四五六七八九十]{0,2}(?:半)?(?:左右|前后|以后|之后|之前|前)?的?",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"^(上午|早上|中午|下午|晚上)+", "", cleaned)
+        cleaned = re.sub(
+            r"^(在|给我|帮我|我要|我想|想要|请帮我|麻烦帮我|买|订|预订|来|看|想看|去看)+",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"^(上午|早上|中午|下午|晚上)+", "", cleaned)
         cleaned = cleaned.strip("的《》<>【】[]()，,。.!?！？：:")
         cleaned = re.sub(r"(电影票|影票|电影|影片|票)+$", "", cleaned)
         cleaned = cleaned.strip("的《》<>【】[]()，,。.!?！？：:")
-        if cleaned in {"", "片", "部片", "一部片", "喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}:
-            return ""
         return cleaned
 
     def _extract_multi_movie_names(self, text: str) -> list[str]:
@@ -544,7 +921,14 @@ class LLMNLU:
         segments = re.split(r"和|及|以及|还有|、", normalized)
         names: list[str] = []
         for segment in segments:
+            if self._is_seat_only_segment(segment):
+                continue
             cleaned = self._strip_movie_segment(segment)
+            cleaned = re.sub(
+                r"[0-9一二两三四五六七八九十]+排[0-9一二两三四五六七八九十]+(?:座|号|位)?",
+                "",
+                cleaned,
+            )
             if cleaned and not any(
                 snack in cleaned
                 for snack in ["爆米花", "可乐", "薯条", "热狗", "饮料", "套餐"]
@@ -559,14 +943,31 @@ class LLMNLU:
 
     def _strip_movie_segment(self, segment: str) -> str:
         cleaned = str(segment or "")
+        cinema_name = self._extract_cinema_name(cleaned)
+        if cinema_name:
+            cleaned = cleaned.replace(cinema_name, "")
         cleaned = re.sub(
-            r"^(给我|帮我|我要|我想|想要|买|订|预订|来|一张|两张|三张|四张|五张|六张|七张|八张|九张|十张|今天|明天|今晚|明晚|后天|上午|下午|晚上|的)+",
+            r"^(在|给我|帮我|我要|我想|想要|买|订|预订|来|各|一张|两张|三张|四张|五张|六张|七张|八张|九张|十张|今天|明天|今晚|明晚|后天|上午|下午|晚上|的)+",
             "",
             cleaned,
         )
-        cleaned = re.sub(r"(电影票|影票|电影|票|的)+$", "", cleaned)
+        cleaned = re.sub(
+            r"(各?[0-9一二两三四五六七八九十]+张|电影票|影票|电影|票|的)+$",
+            "",
+            cleaned,
+        )
         cleaned = cleaned.strip("《》<>【】[]()，,。.!?：:")
         return cleaned
+
+    @staticmethod
+    def _is_seat_only_segment(segment: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(segment or ""))
+        return bool(
+            re.fullmatch(
+                r"[0-9一二两三四五六七八九十]+排[0-9一二两三四五六七八九十]+(?:座|号|位)?",
+                normalized,
+            )
+        )
 
     def _parse_number_token(self, value: str) -> int | None:
         text = str(value or "").strip()
@@ -612,6 +1013,51 @@ class LLMNLU:
             phrase in normalized
             for phrase in ["附近有什么影院", "附近影院", "周边影院", "附近影城", "nearbycinema", "附近有啥影院"]
         )
+
+    @staticmethod
+    def _is_movie_knowledge_question(text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text)
+        if not normalized:
+            return False
+        if any(
+            marker in normalized
+            for marker in [
+                "退票",
+                "退款",
+                "改签",
+                "优惠券",
+                "取票",
+                "支付",
+                "付款",
+                "订单",
+                "锁座",
+                "座位",
+                "规则",
+                "政策",
+            ]
+        ):
+            return False
+        if any(
+            marker in normalized
+            for marker in [
+                "谁演的",
+                "谁主演",
+                "主演是谁",
+                "演员是谁",
+                "谁饰演",
+                "扮演者",
+                "导演是谁",
+                "谁导演",
+                "讲什么",
+                "剧情",
+                "结局",
+                "彩蛋",
+                "片长",
+                "上映时间",
+            ]
+        ):
+            return True
+        return bool(re.search(r"(?:.+?)(?:是谁|是什么|什么意思)$", normalized))
 
     @staticmethod
     def _apply_nearby_showtime_preferences(
@@ -706,6 +1152,41 @@ class LLMNLU:
         actor = match.group("actor").strip("的《》【】")
         return actor if actor not in {"电影", "影片", "最近"} else ""
 
+    def _extract_recommendation_slots(self, text: str) -> dict[str, Any]:
+        normalized = _normalize_short_text(text)
+        if not any(word in normalized for word in ["推荐", "高分", "好看", "热映", "热门"]):
+            return {}
+        if not any(word in normalized for word in ["电影", "影片", "片"]):
+            return {}
+        slots: dict[str, Any] = {
+            "movieLimit": 3,
+            "__clearSlots": [
+                "movieId",
+                "movieName",
+                "genre",
+                "showtimeId",
+                "seatIds",
+                "seatPositions",
+                "orderId",
+                "lockId",
+                "snackIds",
+                "snackItems",
+                "snackRequests",
+            ],
+        }
+        date_value = self._extract_date(text)
+        if date_value:
+            slots["date"] = date_value
+        if any(word in normalized for word in ["高分", "评分高", "口碑"]):
+            slots["recommendationCriteria"] = "high_rating"
+        elif any(word in normalized for word in ["热映", "热门", "火"]):
+            slots["recommendationCriteria"] = "hot"
+        else:
+            slots["recommendationCriteria"] = "high_rating"
+        if any(word in normalized for word in ["还能看", "可看", "今天还可观看", "今天能看"]):
+            slots.setdefault("date", "today")
+        return slots
+
     @staticmethod
     def _extract_showtime_query_movie_name(text: str) -> str:
         normalized = re.sub(r"\s+", "", text)
@@ -720,6 +1201,14 @@ class LLMNLU:
             r"(?:场次|放映时间|什么时候(?:有|能看)?|几点(?:有|能看)?)$",
             normalized,
         )
+        if not nearby_context:
+            nearby_context = re.search(
+                r"(?:附近|周边)?(?:最近的?|就近)?(?:电影院|影院|影城)"
+                r"(?:里|中|，|,|的)?(?P<name>.+?)"
+                r"(?:电影|影片)?(?:的)?(?:最近)?(?:最早)?(?:一场)?"
+                r"(?:场次|放映时间|什么时候(?:有|能看)?|几点(?:有|能看)?)$",
+                normalized,
+            )
         if nearby_context:
             candidate = nearby_context.group("name")
         else:
@@ -751,13 +1240,21 @@ class LLMNLU:
                     candidate = leading.group("name") if leading else ""
 
         candidate = re.sub(
-            r"^(?:给我|帮我|我要|我想|请|麻烦)?(?:找|查|看)"
+            r"^(?:那|然后|接着|继续)?"
+            r"(?:给我|帮我|我要|我想|想要|请|麻烦)?"
+            r"(?:找|查|看|要看|想看)"
             r"(?:一个|一下|下)?(?:距离我)?(?:最近)?(?:的)?",
             "",
             candidate,
         )
         candidate = re.sub(
             r"^(?:(?:今天|今晚|明天|明晚|后天|周末|最早|最近|一场|的|里|中)+)",
+            "",
+            candidate,
+        )
+        candidate = re.sub(
+            r"^(?:\d{1,2}|[一二两三四五六七八九十]{1,3})月"
+            r"(?:\d{1,2}|[一二两三四五六七八九十]{1,3})(?:号|日)?(?:的)?",
             "",
             candidate,
         )
@@ -791,6 +1288,8 @@ class LLMNLU:
                 "我要买票",
             ]
         ):
+            return True
+        if re.search(r"(?:给我|帮我|我要|我想|想要|请|麻烦)?(?:买|订|预订|来|要).{0,50}(?:电影票|影票)", normalized):
             return True
 
         has_date = any(marker in normalized for marker in ["今天", "今晚", "明天", "明晚", "后天", "周末"])

@@ -14,6 +14,8 @@ class CardBuilder:
             return self.payment_cards(result.data)
         if result.data.get("navigation"):
             return [self.navigation_card(result.data["navigation"])]
+        if result.data.get("directShowtimes"):
+            return self.showtime_cards(result.data.get("showtimes", []))
         if plan.action == "search_movies":
             return self.movie_cards(result.data.get("movies", []))
         if plan.action == "search_showtimes":

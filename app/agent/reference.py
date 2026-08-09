@@ -127,6 +127,11 @@ class ReferenceResolver:
         if any(word in text for word in ["这个", "这场", "这家"]) and state.selected:
             self._apply_current_selection(state, slots, text)
 
+        snack_request_selected = self._apply_snack_request_selection(
+            state,
+            slots,
+        )
+
         if state.pending_action == "ask_time":
             self._normalize_followup_time(text, slots)
 
@@ -144,6 +149,8 @@ class ReferenceResolver:
             intent = "select_showtime"
         elif selected_slot in {"movieId", "cinemaId"}:
             intent = "select_or_modify"
+        elif snack_request_selected:
+            intent = "select_snacks"
         elif state.pending_action == "ask_time" and self._is_any_time(text):
             slots["timePreference"] = "any"
             self._add_clear_slots(slots, "timeRange")
@@ -155,6 +162,67 @@ class ReferenceResolver:
             intent = "book_ticket"
 
         return nlu.model_copy(update={"intent": intent, "slots": slots})
+
+    def _apply_snack_request_selection(
+        self,
+        state: AgentState,
+        slots: dict[str, Any],
+    ) -> bool:
+        requests = slots.get("snackRequests")
+        candidates = state.selected.get("snack_candidates") or []
+        if not isinstance(requests, list) or not isinstance(candidates, list):
+            return False
+        if not requests or not candidates:
+            return False
+
+        snack_items: list[dict[str, int]] = []
+        snack_ids: list[Any] = []
+        for request in requests:
+            if not isinstance(request, dict):
+                continue
+            requested_name = str(request.get("name") or "").strip()
+            match = self._match_named_candidate(candidates, requested_name)
+            if not match:
+                continue
+            snack_id = match.get("snackId")
+            if snack_id in [None, ""]:
+                continue
+            quantity = self._positive_int(request.get("quantity")) or 1
+            snack_ids.append(snack_id)
+            snack_items.append({"snackId": snack_id, "quantity": quantity})
+
+        if not snack_items:
+            return False
+        slots["snackIds"] = snack_ids
+        slots["snackItems"] = snack_items
+        return True
+
+    def _match_named_candidate(
+        self,
+        candidates: list[Any],
+        requested_name: str,
+    ) -> dict[str, Any] | None:
+        normalized_request = self._normalize_match_text(requested_name)
+        if not normalized_request:
+            return None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_name = self._normalize_match_text(
+                candidate.get("name") or candidate.get("snackName")
+            )
+            if not candidate_name:
+                continue
+            if (
+                normalized_request in candidate_name
+                or candidate_name in normalized_request
+            ):
+                return candidate
+        return None
+
+    @staticmethod
+    def _normalize_match_text(value: Any) -> str:
+        return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(value or "")).casefold()
 
     def _clear_downstream_selection(self, slots: dict[str, Any]) -> None:
         self._add_clear_slots(

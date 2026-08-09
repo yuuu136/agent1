@@ -106,6 +106,7 @@ class SpringBootMovieTicketMCP:
                 keyword,
                 arguments.get("genre"),
             )
+            movies = self._enrich_movie_cards_with_showtimes(movies, arguments)
             movies = self._filter_movie_cards_by_showtime_constraints(
                 movies,
                 arguments,
@@ -169,6 +170,7 @@ class SpringBootMovieTicketMCP:
             genre=arguments.get("genre"),
         )
         movies = self._filter_movies(all_movies, keyword, genre, actor)
+        movies = self._enrich_movie_cards_with_showtimes(movies, arguments)
         movies = self._filter_movie_cards_by_showtime_constraints(movies, arguments)
         if actor and not movies:
             return ToolResult(
@@ -186,6 +188,7 @@ class SpringBootMovieTicketMCP:
         # Keyword/genre search got nothing → show all available movies
         if not movies and not fallback_reason and (keyword or arguments.get("genre") or arguments.get("movieName")):
             movies = self._load_movie_cards(arguments, keyword=None, genre=None)
+            movies = self._enrich_movie_cards_with_showtimes(movies, arguments)
             movies = self._filter_movie_cards_by_showtime_constraints(movies, arguments)
             if movies:
                 fallback_reason = "keyword_not_found"
@@ -345,6 +348,13 @@ class SpringBootMovieTicketMCP:
         date_value: str | None,
         cinema_id: Any,
     ) -> list[dict[str, Any]]:
+        if date_value is None:
+            return self._load_showtimes_for_cinema_date_window(
+                arguments,
+                query_movie_ids,
+                cinema_id,
+            )
+
         showtimes: list[dict[str, Any]] = []
         for query_movie_id in query_movie_ids:
             if query_movie_id in [None, ""]:
@@ -370,6 +380,37 @@ class SpringBootMovieTicketMCP:
             arguments.get("timePreference"),
             arguments.get("excludeShowtimeId"),
         )
+
+    def _load_showtimes_for_cinema_date_window(
+        self,
+        arguments: dict[str, Any],
+        query_movie_ids: list[Any],
+        cinema_id: Any,
+    ) -> list[dict[str, Any]]:
+        days = self._positive_int(arguments.get("lookaheadDays")) or 7
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        combined: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for offset in range(days):
+            date_value = (today + timedelta(days=offset)).isoformat()
+            for showtime in self._load_showtimes_for_cinema(
+                arguments,
+                query_movie_ids,
+                date_value,
+                cinema_id,
+            ):
+                key = str(showtime.get("showtimeId") or "")
+                if not key:
+                    key = "|".join(
+                        str(showtime.get(name) or "")
+                        for name in ["movieId", "cinemaId", "hallName", "startAt"]
+                    )
+                if key in seen:
+                    continue
+                seen.add(key)
+                combined.append(showtime)
+        combined.sort(key=self._showtime_start_sort_key)
+        return combined
 
     def get_seats(self, arguments: dict[str, Any]) -> ToolResult:
         showtime_id = arguments.get("showtimeId")
@@ -1059,6 +1100,56 @@ class SpringBootMovieTicketMCP:
         )
         return [self._format_movie(item) for item in data.get("records") or []]
 
+    def _enrich_movie_cards_with_showtimes(
+        self,
+        movies: list[dict[str, Any]],
+        arguments: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not movies:
+            return movies
+        should_enrich = any(
+            arguments.get(key)
+            for key in ["movieName", "keyword", "cinemaId", "date", "timeRange", "ticketCount", "hallType"]
+        )
+        if not should_enrich:
+            return movies
+
+        enriched: list[dict[str, Any]] = []
+        date_value = self._spring_date(arguments.get("date"))
+        for movie in movies[:10]:
+            movie_id = movie.get("movieId")
+            if movie_id in [None, ""]:
+                enriched.append(movie)
+                continue
+            showtimes = self._load_showtimes_for_cinema(
+                arguments,
+                [movie_id],
+                date_value,
+                arguments.get("cinemaId"),
+            )
+            updated = dict(movie)
+            if showtimes:
+                updated["upcomingShowtimes"] = showtimes
+                updated["showtimeCount"] = len(showtimes)
+                prices = [
+                    item.get("price")
+                    for item in showtimes
+                    if item.get("price") not in [None, ""]
+                ]
+                if prices:
+                    updated["minPrice"] = min(prices)
+                remaining_seats = [
+                    item.get("remainingSeats")
+                    for item in showtimes
+                    if item.get("remainingSeats") not in [None, ""]
+                ]
+                if remaining_seats:
+                    updated["remainingSeats"] = sum(int(value) for value in remaining_seats)
+            enriched.append(updated)
+        if len(movies) > 10:
+            enriched.extend(movies[10:])
+        return enriched
+
     def _fallback_movie_cards(
         self,
         arguments: dict[str, Any],
@@ -1068,6 +1159,7 @@ class SpringBootMovieTicketMCP:
             return [], None
 
         today_movies = self._today_high_rating_fallback(arguments)
+        today_movies = self._exclude_requested_movie(today_movies, arguments)
         today_movies = self._exclude_unreleased_movies(today_movies)
         if today_movies:
             return today_movies, "today_high_rating"
@@ -1101,6 +1193,7 @@ class SpringBootMovieTicketMCP:
             today_args,
         )
         today_movies = self._exclude_unreleased_movies(today_movies)
+        today_movies = self._exclude_requested_movie(today_movies, arguments)
         today_movies = self._rank_recommended_movies(today_movies, "high_rating")
         today_movies = self._apply_movie_limit(today_movies, today_args["movieLimit"])
         if today_movies:
@@ -1216,6 +1309,42 @@ class SpringBootMovieTicketMCP:
             )
         ]
 
+    def _exclude_requested_movie(
+        self,
+        movies: list[dict[str, Any]],
+        arguments: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        requested_name = str(
+            arguments.get("movieName") or arguments.get("keyword") or ""
+        ).strip()
+        requested_id = str(arguments.get("movieId") or "").strip()
+        if not requested_name and not requested_id:
+            return movies
+        return [
+            movie
+            for movie in movies
+            if not (
+                requested_id
+                and str(movie.get("movieId") or movie.get("id") or "").strip()
+                == requested_id
+            )
+            and not (
+                requested_name
+                and self._normalize_match_text(requested_name)
+                in self._normalize_match_text(
+                    movie.get("movieName") or movie.get("name")
+                )
+            )
+        ]
+
+    @staticmethod
+    def _normalize_match_text(value: Any) -> str:
+        return re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fff]+",
+            "",
+            str(value or ""),
+        ).casefold()
+
     def _format_movie(self, item: dict[str, Any]) -> dict[str, Any]:
         poster = (
             item.get("posterUrl")
@@ -1266,7 +1395,8 @@ class SpringBootMovieTicketMCP:
             formatted_showtimes = [
                 {
                     "showtimeId": item.get("id") or item.get("showtimeId"),
-                    "cinemaName": cinema.get("name") or arguments.get("cinemaName"),
+                    "cinemaName": self._item_cinema_name(item, cinema, arguments),
+                    "cinemaId": self._item_cinema_id(item, cinema, arguments),
                     "hallName": item.get("hallName"),
                     "startAt": item.get("startAt"),
                     "date": str(item.get("startAt") or "")[:10],
@@ -1577,7 +1707,7 @@ class SpringBootMovieTicketMCP:
             if not showtimes:
                 continue
             parts: list[str] = []
-            for st in showtimes[:2]:  # 每部最多 2 场
+            for st in showtimes[:6]:  # 每部最多 6 场，避免漏掉未来新增场次
                 cinema = st.get("cinemaName") or ""
                 hall = st.get("hallName") or ""
                 start = st.get("startAt") or ""
@@ -1658,8 +1788,8 @@ class SpringBootMovieTicketMCP:
                         "showtimeId": item.get("id"),
                         "movieId": group.get("id"),
                         "movieName": group.get("name"),
-                        "cinemaId": cinema.get("id"),
-                        "cinemaName": cinema.get("name"),
+                        "cinemaId": self._item_cinema_id(item, cinema, {}),
+                        "cinemaName": self._item_cinema_name(item, cinema, {}),
                         "hallName": item.get("hallName"),
                         "hallType": item.get("hallType"),
                         "language": item.get("language"),
@@ -1672,6 +1802,36 @@ class SpringBootMovieTicketMCP:
                     }
                 )
         return showtimes
+
+    @staticmethod
+    def _item_cinema_name(
+        item: dict[str, Any],
+        cinema: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> Any:
+        item_cinema = item.get("cinema") if isinstance(item.get("cinema"), dict) else {}
+        return (
+            item.get("cinemaName")
+            or item.get("cinema_name")
+            or item_cinema.get("name")
+            or cinema.get("name")
+            or arguments.get("cinemaName")
+        )
+
+    @staticmethod
+    def _item_cinema_id(
+        item: dict[str, Any],
+        cinema: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> Any:
+        item_cinema = item.get("cinema") if isinstance(item.get("cinema"), dict) else {}
+        return (
+            item.get("cinemaId")
+            or item.get("cinema_id")
+            or item_cinema.get("id")
+            or cinema.get("id")
+            or arguments.get("cinemaId")
+        )
 
     def _filter_showtimes(
         self,
@@ -1867,6 +2027,8 @@ class SpringBootMovieTicketMCP:
 
     def _display_time_range(self, value: Any) -> str:
         text = str(value)
+        if re.fullmatch(r"\d{2}:\d{2}", text):
+            return text
         return {
             "evening": "晚上",
             "afternoon": "下午",

@@ -1,6 +1,8 @@
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
+from functools import lru_cache
 
 from app.agent.intent_catalog import intent_catalog
 from app.rag.documents import KnowledgeChunk
@@ -10,6 +12,10 @@ from app.utils.config_handler import chroma_config, rag_config
 
 
 logger = logging.getLogger(__name__)
+
+
+class IntentRAGUnavailable(RuntimeError):
+    """Raised when intent RAG was required but the embedding service failed."""
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,11 @@ class IntentRAGRetriever:
             else float(settings.get("margin_threshold", 0.04))
         )
         self.top_k = int(settings.get("top_k", 8))
+        self.max_retries = max(0, int(settings.get("max_retries", 1)))
+        self.retry_backoff_seconds = max(
+            0.0,
+            float(settings.get("retry_backoff_seconds", 0.3)),
+        )
         self._query_cache: dict[str, IntentMatch | None] = {}
         self._query_cache_size = max(1, int(settings.get("query_cache_size", 256)))
         self.store = ChromaVectorStore(
@@ -112,18 +123,7 @@ class IntentRAGRetriever:
         if cache_key in self._query_cache:
             return self._query_cache[cache_key]
 
-        try:
-            query_vector = self.embedding_client.embed_query(text)
-        except Exception as exc:
-            if getattr(exc, "status_code", None) == 429:
-                logger.warning("Intent Embedding rate limited; skip RAG for this query")
-            else:
-                logger.warning(
-                    "Intent Embedding unavailable; skip RAG for this query: %s",
-                    exc,
-                )
-            self._remember_query(cache_key, None)
-            return None
+        query_vector = self._embed_query_with_retry(text)
         if not query_vector:
             self._remember_query(cache_key, None)
             return None
@@ -208,7 +208,7 @@ class IntentRAGRetriever:
         for start in range(0, len(self.examples), batch_size):
             batch = self.examples[start : start + batch_size]
             embeddings.extend(
-                self.embedding_client.embed_texts(
+                self._embed_texts_with_retry(
                     [example.text for example in batch]
                 )
             )
@@ -234,5 +234,27 @@ class IntentRAGRetriever:
     def _stable_id(self, text: str) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
 
+    def _embed_query_with_retry(self, text: str) -> list[float]:
+        vectors = self._embed_texts_with_retry([text])
+        return vectors[0] if vectors else []
 
-intent_rag_retriever = IntentRAGRetriever()
+    def _embed_texts_with_retry(self, texts: list[str]) -> list[list[float]]:
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self.embedding_client.embed_texts(texts)
+            except Exception as exc:
+                last_exc = exc
+                status_code = getattr(exc, "status_code", None)
+                if attempt >= self.max_retries or status_code != 429:
+                    break
+                time.sleep(self.retry_backoff_seconds * (attempt + 1))
+        message = str(last_exc or "unknown error")
+        if getattr(last_exc, "status_code", None) == 429:
+            message = f"Embedding rate limited: {message}"
+        raise IntentRAGUnavailable(message) from last_exc
+
+
+@lru_cache(maxsize=1)
+def get_intent_rag_retriever() -> IntentRAGRetriever:
+    return IntentRAGRetriever()
