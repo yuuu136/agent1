@@ -1,7 +1,7 @@
 ﻿import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -181,11 +181,16 @@ class SpringBootMovieTicketMCP:
                 suggestions=["最近热映", "推荐一部喜剧", "附近有什么影院"],
             )
         fallback_reason = None
+        if not movies and recommendation_criteria and not actor:
+            movies, fallback_reason = self._fallback_recommendation_movie_cards(
+                arguments,
+            )
         if not movies:
-            movies, fallback_reason = self._fallback_movie_cards(
+            movies, standard_fallback_reason = self._fallback_movie_cards(
                 arguments,
                 all_movies,
             )
+            fallback_reason = fallback_reason or standard_fallback_reason
         # Keyword/genre search got nothing → show all available movies
         if not movies and not fallback_reason and (keyword or arguments.get("genre") or arguments.get("movieName")):
             movies = self._load_movie_cards(arguments, keyword=None, genre=None)
@@ -397,10 +402,15 @@ class SpringBootMovieTicketMCP:
         nearby_first = bool(arguments.get("nearbyFirst"))
         has_cinema = arguments.get("cinemaId") not in [None, ""]
         if nearby_first and not has_cinema:
+            # A nearby-cinema browse can stay within 5 km, but a request for a
+            # specific movie should keep looking until it finds the nearest
+            # cinema that actually has that movie on sale.
+            search_radius = self._positive_int(arguments.get("radius")) or 20
             nearby = self.search_nearby_cinemas(
                 {
                     **arguments,
                     "cinemaLimit": self._positive_int(arguments.get("cinemaLimit")) or 5,
+                    "radius": search_radius,
                 }
             )
             if not nearby.success:
@@ -1240,7 +1250,16 @@ class SpringBootMovieTicketMCP:
             return movies
         should_enrich = any(
             arguments.get(key)
-            for key in ["movieName", "keyword", "cinemaId", "date", "timeRange", "ticketCount", "hallType"]
+            for key in [
+                "movieName",
+                "keyword",
+                "cinemaId",
+                "date",
+                "timeRange",
+                "ticketCount",
+                "hallType",
+                "recommendationCriteria",
+            ]
         )
         if not should_enrich:
             return movies
@@ -1304,6 +1323,100 @@ class SpringBootMovieTicketMCP:
             return tomorrow_movies, "tomorrow_same_type"
 
         return [], None
+
+    def _fallback_recommendation_movie_cards(
+        self,
+        arguments: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Use actual sellable showtimes when the movie catalog has no current results."""
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        tomorrow = today + timedelta(days=1)
+        requested_date = self._spring_date(arguments.get("date"))
+        candidate_dates = (
+            [requested_date]
+            if requested_date
+            else [today.isoformat(), tomorrow.isoformat()]
+        )
+        if requested_date == today.isoformat():
+            candidate_dates.append(tomorrow.isoformat())
+
+        for date_value in candidate_dates:
+            search_arguments = {**arguments, "date": date_value}
+            movies = self._available_movie_cards_for_date(search_arguments, date_value)
+            movies = self._rank_recommended_movies(
+                movies,
+                arguments.get("recommendationCriteria"),
+            )
+            movies = self._apply_movie_limit(
+                movies,
+                arguments.get("movieLimit") or 3,
+            )
+            if not movies:
+                continue
+
+            is_tomorrow_fallback = (
+                date_value == tomorrow.isoformat()
+                and requested_date != tomorrow.isoformat()
+            )
+            return movies, "tomorrow_available" if is_tomorrow_fallback else None
+
+        return [], None
+
+    def _available_movie_cards_for_date(
+        self,
+        arguments: dict[str, Any],
+        date_value: str,
+    ) -> list[dict[str, Any]]:
+        data = self._get_business(
+            "/api/user/showtimes",
+            arguments,
+            {
+                "cinemaId": arguments.get("cinemaId"),
+                "date": date_value,
+                "hallType": arguments.get("hallType"),
+            },
+        )
+        movies = self._format_showtime_movies(data, arguments)
+        if not movies:
+            return []
+
+        catalog_data = self._get_business(
+            "/api/user/movies",
+            arguments,
+            {"page": 1, "size": 100},
+        )
+        metadata_by_id = {
+            str(movie.get("movieId")): movie
+            for movie in (
+                self._format_movie(item)
+                for item in catalog_data.get("records") or []
+                if isinstance(item, dict)
+            )
+            if movie.get("movieId") not in [None, ""]
+        }
+
+        merged_movies: list[dict[str, Any]] = []
+        for movie in movies:
+            metadata = metadata_by_id.get(str(movie.get("movieId"))) or {}
+            merged = dict(metadata)
+            merged.update(movie)
+            for key in [
+                "genre",
+                "score",
+                "cast",
+                "durationMinutes",
+                "poster",
+                "posterUrl",
+                "status",
+            ]:
+                if merged.get(key) in [None, ""] and metadata.get(key) not in [None, ""]:
+                    merged[key] = metadata[key]
+            merged_movies.append(merged)
+
+        return self._filter_movie_cards_by_showtime_constraints(
+            merged_movies,
+            arguments,
+        )
 
     def _fallback_cinema_movie_cards(
         self,
@@ -1795,6 +1908,11 @@ class SpringBootMovieTicketMCP:
                 message = f"没有找到{genre}类型的影片，看看这些怎么样"
             else:
                 message = "没有找到匹配的影片，这些也很棒"
+        elif fallback_reason == "tomorrow_available":
+            if arguments.get("recommendationCriteria") == "couple":
+                message = "今天暂无可看的排片，先为你挑了明天适合情侣看的电影。"
+            else:
+                message = "今天暂时没有可看的排片，先为你推荐明天可购的电影。"
         else:
             return None
 
@@ -2098,7 +2216,10 @@ class SpringBootMovieTicketMCP:
                 distance = self._format_distance(showtimes[0].get("distance"))
                 suffix = f"（距你约{distance}）" if distance else ""
                 if arguments.get("showtimeLimit") == 1:
-                    return f"已为你找到{cinema_name}{suffix}最早可看的场次。"
+                    movie_name = str(showtimes[0].get("movieName") or arguments.get("movieName") or "")
+                    movie_label = f"《{movie_name}》" if movie_name else ""
+                    time_label = self._showtime_time_label(showtimes[0])
+                    return f"已为你找到{cinema_name}{suffix}{movie_label}最近可看的场次：{time_label}。"
                 return f"已优先选择{cinema_name}{suffix}，以下场次按开场时间从早到晚排列。"
             return f"为你找到了 {len(showtimes)} 个符合条件的场次。"
 
@@ -2118,6 +2239,31 @@ class SpringBootMovieTicketMCP:
         if distance < 1:
             return f"{distance * 1000:.0f}米"
         return f"{distance:.1f}公里"
+
+    @staticmethod
+    def _showtime_time_label(showtime: dict[str, Any]) -> str:
+        raw_date = str(showtime.get("date") or showtime.get("startAt") or "")[:10]
+        time_value = str(showtime.get("time") or "").strip()
+        if not time_value:
+            time_value = str(showtime.get("startAt") or "")[11:16]
+        if not raw_date:
+            return time_value or "待确认时间"
+
+        try:
+            show_date = date.fromisoformat(raw_date)
+        except ValueError:
+            return f"{raw_date} {time_value}".strip()
+
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        if show_date == today:
+            date_label = f"今天 {show_date.month}月{show_date.day}日"
+        elif show_date == today + timedelta(days=1):
+            date_label = f"明天 {show_date.month}月{show_date.day}日"
+        elif show_date == today + timedelta(days=2):
+            date_label = f"后天 {show_date.month}月{show_date.day}日"
+        else:
+            date_label = f"{show_date.month}月{show_date.day}日"
+        return f"{date_label} {time_value}".strip()
 
     @staticmethod
     def _positive_int(value: Any) -> int | None:

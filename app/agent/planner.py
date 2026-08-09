@@ -155,6 +155,29 @@ class TaskPlanner:
                     },
                     state="selecting_showtime",
                 )
+            if not any(
+                showtime_params.get(key) not in [None, ""]
+                for key in [
+                    "movieId",
+                    "movieName",
+                    "genre",
+                    "cinemaId",
+                    "cinemaName",
+                    "date",
+                    "timeRange",
+                    "location",
+                ]
+            ):
+                return AgentPlan(
+                    action="ask",
+                    reason="没有可用于换场的当前场次上下文",
+                    params={
+                        "message": "你还没有选定要更换的场次，请先告诉我想看哪部电影或选择一个场次。",
+                        "missing": ["movieName"],
+                        "next_ask": "movieName",
+                    },
+                    state="collecting_movieName",
+                )
             return AgentPlan(
                 action="search_showtimes",
                 params=showtime_params,
@@ -401,6 +424,31 @@ class TaskPlanner:
                     state="selecting_seats",
                 )
             if not slots.get("showtimeId"):
+                if (
+                    nlu.intent == "seat_query"
+                    and not any(
+                        slots.get(key) not in [None, ""]
+                        for key in [
+                            "movieId",
+                            "movieName",
+                            "genre",
+                            "cinemaId",
+                            "cinemaName",
+                            "date",
+                            "timeRange",
+                        ]
+                    )
+                ):
+                    return AgentPlan(
+                        action="ask",
+                        reason="换座位需要先确定场次",
+                        params={
+                            "message": "需要先选择具体场次后才能换座位。你可以先告诉我想看哪部电影，或从订单里选择要换座的订单。",
+                            "missing": ["showtimeId"],
+                            "next_ask": "showtimeId",
+                        },
+                        state="selecting_showtime",
+                    )
                 return AgentPlan(action="search_showtimes",
                     params=self._pick(slots, ["movieId", "movieName", "genre", "date",
                         "timeRange", "ticketCount", "cinemaId", "cinemaName",

@@ -90,7 +90,7 @@ def is_skip_snacks_text(text: str) -> bool:
 
 def is_capability_question_text(text: str) -> bool:
     normalized = _normalize_short_text(text)
-    if not any(marker in normalized for marker in ["电影票", "影票", "订票", "买票"]):
+    if not any(marker in normalized for marker in ["电影票", "影票", "订票", "买票", "买电影", "订电影", "购票"]):
         return False
     return any(
         phrase in normalized
@@ -103,6 +103,15 @@ def is_capability_question_text(text: str) -> bool:
             "能帮我订",
             "能不能帮我订",
             "可不可以帮我订",
+            "能否买",
+            "能否订",
+            "可否买",
+            "可否订",
+            "能不能买",
+            "能不能订",
+            "能不能购票",
+            "可以购票",
+            "能否购票",
             "会买电影票",
             "能买电影票",
             "可以买电影票",
@@ -111,6 +120,14 @@ def is_capability_question_text(text: str) -> bool:
             "支持买电影票",
             "支持订电影票",
         ]
+    )
+
+
+def is_change_seat_text(text: str) -> bool:
+    normalized = _normalize_short_text(text)
+    return any(word in normalized for word in ["座位", "选座", "位置"]) and any(
+        word in normalized
+        for word in ["换", "改", "重新", "重选", "不要这个", "不要当前", "不想要这个"]
     )
 
 
@@ -172,6 +189,13 @@ class LLMNLU:
             if is_skip_snacks_text(text):
                 return NLUResult(
                     intent="skip_snacks",
+                    confidence=0.95,
+                    intent_source="rule",
+                    reference_text=text,
+                )
+            if is_change_seat_text(text):
+                return NLUResult(
+                    intent="seat_query",
                     confidence=0.95,
                     intent_source="rule",
                     reference_text=text,
@@ -1127,6 +1151,8 @@ class LLMNLU:
                 "最近一场",
                 "时间最近",
                 "离现在最近",
+                "最近几点",
+                "最近能看",
                 "找一个",
                 "一场",
             ]
@@ -1184,15 +1210,38 @@ class LLMNLU:
             normalized,
         )
         if not match:
+            match = re.search(
+                r"^(?P<actor>[\u4e00-\u9fff·]{2,8}?)"
+                r"(?:最近|近期)?(?:有)?(?:正在|当前)?上映(?:的)?(?:电影|影片)(?:吗|么|嘛)?$",
+                normalized,
+            )
+        if not match:
             return ""
         actor = match.group("actor").strip("的《》【】")
         return actor if actor not in {"电影", "影片", "最近"} else ""
 
     def _extract_recommendation_slots(self, text: str) -> dict[str, Any]:
         normalized = _normalize_short_text(text)
-        if not any(word in normalized for word in ["推荐", "高分", "好看", "热映", "热门"]):
-            return {}
         if not any(word in normalized for word in ["电影", "影片", "片"]):
+            return {}
+        is_general_browse = any(
+            phrase in normalized
+            for phrase in [
+                "有什么电影",
+                "有哪些电影",
+                "什么电影可以看",
+                "电影可以看",
+                "电影能看",
+                "正在上映",
+                "热映电影",
+            ]
+        )
+        is_couple = any(word in normalized for word in ["情侣", "约会", "恋人", "对象"])
+        if not (
+            is_general_browse
+            or is_couple
+            or any(word in normalized for word in ["推荐", "高分", "好看", "热映", "热门"])
+        ):
             return {}
         slots: dict[str, Any] = {
             "movieLimit": 3,
@@ -1213,13 +1262,17 @@ class LLMNLU:
         date_value = self._extract_date(text)
         if date_value:
             slots["date"] = date_value
-        if any(word in normalized for word in ["高分", "评分高", "口碑"]):
+        if is_couple:
+            slots["recommendationCriteria"] = "couple"
+        elif any(word in normalized for word in ["高分", "评分高", "口碑"]):
             slots["recommendationCriteria"] = "high_rating"
         elif any(word in normalized for word in ["热映", "热门", "火"]):
             slots["recommendationCriteria"] = "hot"
+        elif is_general_browse:
+            slots["recommendationCriteria"] = "hot"
         else:
             slots["recommendationCriteria"] = "high_rating"
-        if any(word in normalized for word in ["还能看", "可看", "今天还可观看", "今天能看"]):
+        if any(word in normalized for word in ["还能看", "可看", "今天还可观看", "今天能看", "今天有什么电影", "今天有哪些电影"]):
             slots.setdefault("date", "today")
         return slots
 
@@ -1234,6 +1287,32 @@ class LLMNLU:
         quoted = re.search(r"[《【](?P<name>[^》】]+)[》】]", normalized)
         if quoted:
             return quoted.group("name").strip()
+
+        direct = re.search(
+            r"(?P<name>.+?)"
+            r"(?:今天|今晚|明天|明晚|后天|周末)?"
+            r"(?:上午|早上|中午|下午|晚上)?"
+            r"[0-9一二两三四五六七八九十]{0,3}(?:[:：点])?"
+            r"[0-9一二两三四五六七八九十]{0,2}(?:半)?"
+            r"(?:有|有没有|有哪些|有什么)?"
+            r"(?:场次|放映时间)(?:吗|么|嘛|啊)?$",
+            normalized,
+        )
+        nearby_wording = any(
+            phrase in normalized
+            for phrase in [
+                "距离我最近",
+                "离我最近",
+                "最近的影院",
+                "最近影院",
+                "附近最近",
+                "就近影院",
+            ]
+        )
+        if direct and not nearby_wording:
+            candidate = direct.group("name")
+        else:
+            candidate = ""
 
         nearby_context = re.search(
             r"(?:距离(?:我)?|离我|就近).{0,8}?(?:电影院|影院)"
@@ -1250,9 +1329,9 @@ class LLMNLU:
                 r"(?:场次|放映时间|什么时候(?:有|能看)?|几点(?:有|能看)?)$",
                 normalized,
             )
-        if nearby_context:
+        if not candidate and nearby_context:
             candidate = nearby_context.group("name")
-        else:
+        elif not candidate:
             nearby_earliest = re.search(
                 r"(?:最早一场|最近一场|最早)(?:的)?(?P<name>[^，。！？,.!?]+)$",
                 normalized,
