@@ -631,7 +631,7 @@ class SpringBootMovieTicketMCP:
             or f"agent-{uuid.uuid4().hex}"
         )
         raw = self._post_business(
-            f"/api/user/orders/{order_id}/pay/qrcode",
+            f"/api/user/orders/{order_id}/pay",
             arguments,
             {"idempotencyKey": idempotency_key},
         )
