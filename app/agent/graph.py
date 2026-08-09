@@ -109,7 +109,7 @@ def ask_node(data: AgentGraphState) -> dict[str, Any]:
     if action == "smalltalk" and state.pending_action:
         ack_messages = {
             "ask_time": "那我们就看最近的场次吧？或者你说个偏好的时间～",
-            "ask_ticket_count": "默认帮你订2张，要调整吗？",
+            "ask_ticket_count": "还需要确认票数，想买几张呢？",
             "get_seats": "想坐哪个位置？中间、前排还是后排？",
         }
         message = ack_messages.get(state.pending_action, message)

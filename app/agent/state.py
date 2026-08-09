@@ -73,7 +73,6 @@ class InMemorySessionStore:
                 state=settings.get("default_state", "idle"),
                 slots={
                     "city": settings.get("default_city", ""),
-                    "ticketCount": settings.get("default_ticket_count", 2),
                     "seatPreference": settings.get("default_seat_preference", "middle"),
                 },
             )

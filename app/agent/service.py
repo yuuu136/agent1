@@ -424,7 +424,6 @@ class AgentService:
             state.pending_action = None
             state.slots = {
                 "city": settings.get("default_city", ""),
-                "ticketCount": settings.get("default_ticket_count", 2),
                 "seatPreference": settings.get("default_seat_preference", "middle"),
             }
             result.message = "已取消当前购票流程。"
@@ -448,7 +447,6 @@ class AgentService:
                 state.selected.clear()
                 state.slots = {
                     "city": settings.get("default_city", ""),
-                    "ticketCount": settings.get("default_ticket_count", 2),
                     "seatPreference": settings.get(
                         "default_seat_preference",
                         "middle",

@@ -308,6 +308,9 @@ class TaskPlanner:
             if slots.get("showtimeId") and slots.get("seatIds"):
                 seat_ids = slots.get("seatIds")
                 expected_count = self._positive_int(slots.get("ticketCount"))
+                if expected_count is None and isinstance(seat_ids, list):
+                    expected_count = len(seat_ids)
+                    slots["ticketCount"] = expected_count
                 if (
                     expected_count is not None
                     and isinstance(seat_ids, list)

@@ -12,7 +12,7 @@ from app.schemas.agent import AgentState, NLUResult
 FLOWS: dict[str, dict[str, Any]] = {
     "book_ticket": {
         "required": [],           # No hard requirement — book_ticket can
-        "ask_for": ["movieName", "date", "timeRange", "ticketCount"],
+        "ask_for": ["movieName", "date", "timeRange"],
         "execute": "search_movies",
         "description": "订票",
     },
@@ -24,13 +24,13 @@ FLOWS: dict[str, dict[str, Any]] = {
     },
     "select_showtime": {
         "required": ["movieName"],
-        "ask_for": ["date", "timeRange", "ticketCount"],
+        "ask_for": ["date", "timeRange"],
         "execute": "search_showtimes",
         "description": "选场次",
     },
     "select_seats": {
         "required": ["showtimeId"],
-        "ask_for": ["ticketCount"],
+        "ask_for": [],
         "execute": "get_seats",
         "description": "选座",
     },

@@ -187,6 +187,14 @@ class LLMNLU:
                 ]:
                     if key in payload and payload[key] not in [None, ""]:
                         slots[key] = payload[key]
+                if (
+                    request.event == "select_seats"
+                    and "ticketCount" not in slots
+                    and not (state and state.slots.get("ticketCount"))
+                    and isinstance(slots.get("seatIds"), list)
+                    and slots["seatIds"]
+                ):
+                    slots["ticketCount"] = len(slots["seatIds"])
                 return NLUResult(intent=event_intent, confidence=0.90,
                                  intent_source="rule", slots=slots)
 
@@ -246,8 +254,7 @@ class LLMNLU:
         if pending == "ask_ticket_count":
             trimmed = text.strip()
             if trimmed in ("随便", "都行", "不限", "都可以", "无所谓"):
-                return NLUResult(intent="book_ticket", confidence=0.90, intent_source="rule",
-                                 slots={"ticketCount": 2})
+                return NLUResult(intent="book_ticket", confidence=0.90, intent_source="rule")
             num_match = re.match(r"^(\d+|[一二两三四五六七八九十])$", trimmed)
             if num_match:
                 chinese_num = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,

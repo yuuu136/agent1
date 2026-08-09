@@ -51,7 +51,6 @@ agent:
   low_confidence_threshold: 0.45
   high_confidence_threshold: 0.75
   default_city: ""
-  default_ticket_count: 2
   default_seat_preference: middle
 
 spring_boot:
