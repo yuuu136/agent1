@@ -243,7 +243,7 @@ class CardBuilder:
         ]
 
     def payment_cards(self, data: dict[str, Any]) -> list[dict[str, Any]]:
-        qr_code = data.get("qrCode")
+        pay_form = data.get("payForm")
         return [
             {
                 "type": "payment",
@@ -251,7 +251,7 @@ class CardBuilder:
                 "title": "确认支付",
                 "subtitle": self._order_subtitle(data),
                 "meta": self._order_meta(data),
-                "qrCode": qr_code,
+                "payForm": pay_form,
                 "payload": data,
                 "actions": [{
                     "event": "pay_order",

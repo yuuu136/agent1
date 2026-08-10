@@ -142,6 +142,9 @@ class TaskPlanner:
                     "showtimeLimit",
                     "seatPositions",
                     "excludeShowtimeId",
+                    "autoSelectShowtime",
+                    "autoSelectSeats",
+                    "skipSnacks",
                 ],
             )
             if slots.get("orderId") or state.selected.get("order"):
@@ -223,6 +226,9 @@ class TaskPlanner:
                         "nearbyFirst",
                         "cinemaLimit",
                         "showtimeLimit",
+                        "autoSelectShowtime",
+                        "autoSelectSeats",
+                        "skipSnacks",
                     ],
                 ),
                 state="selecting_showtime",
@@ -243,7 +249,10 @@ class TaskPlanner:
             return AgentPlan(
                 action="search_nearby_cinemas",
                 reason="用户询问附近影院",
-                params=self._pick(slots, ["location", "cinemaLimit"]),
+                params=self._pick(
+                    slots,
+                    ["location", "cinemaLimit", "hallType"],
+                ),
                 state="selecting_cinema",
             )
 
@@ -388,6 +397,7 @@ class TaskPlanner:
                         "ticketCount",
                         "seatPreference",
                         "seatPositions",
+                        "autoSelectSeats",
                     ],
                 )
                 return AgentPlan(
@@ -449,14 +459,37 @@ class TaskPlanner:
                         },
                         state="selecting_showtime",
                     )
+                if nlu.intent == "seat_query":
+                    candidates = state.selected.get("showtime_candidates")
+                    if isinstance(candidates, list) and len(candidates) > 1:
+                        return AgentPlan(
+                            action="ask",
+                            reason="选座前需要先确认具体场次",
+                            params={
+                                "message": "想选哪一场呢？请先从上面的场次中选择一场，再帮你选座。",
+                                "missing": ["showtimeId"],
+                                "next_ask": "showtimeId",
+                            },
+                            state="selecting_showtime",
+                        )
                 return AgentPlan(action="search_showtimes",
                     params=self._pick(slots, ["movieId", "movieName", "genre", "date",
                         "timeRange", "ticketCount", "cinemaId", "cinemaName",
                         "hallType", "pricePreference", "timePreference",
-                        "seatPreference", "seatPositions"]),
+                        "seatPreference", "seatPositions", "autoSelectShowtime",
+                        "autoSelectSeats", "skipSnacks"]),
                     state="selecting_showtime")
             return AgentPlan(action="get_seats",
-                params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference", "seatPositions"]),
+                params=self._pick(
+                    slots,
+                    [
+                        "showtimeId",
+                        "ticketCount",
+                        "seatPreference",
+                        "seatPositions",
+                        "autoSelectSeats",
+                    ],
+                ),
                 state="selecting_seats")
 
         if (
@@ -487,6 +520,9 @@ class TaskPlanner:
                         "maxPrice",
                         "pricePreference",
                         "timePreference",
+                        "autoSelectShowtime",
+                        "autoSelectSeats",
+                        "skipSnacks",
                     ],
                 ),
                 state="selecting_showtime",
@@ -526,6 +562,82 @@ class TaskPlanner:
         # movie actually has showtimes. LLM chat may have mentioned films
         # that aren't in our database.
         movie_name = slots.get("movieName")
+        if tr.flow == "book_ticket" and slots.get("autoSelectShowtime"):
+            showtime = self._auto_selectable_showtime_candidate(state)
+            if showtime:
+                params = self._pick(
+                    slots,
+                    [
+                        "ticketCount",
+                        "seatPreference",
+                        "autoSelectSeats",
+                        "skipSnacks",
+                    ],
+                )
+                params.update(
+                    {
+                        key: showtime[key]
+                        for key in [
+                            "showtimeId",
+                            "movieId",
+                            "movieName",
+                            "cinemaId",
+                            "cinemaName",
+                            "hallName",
+                            "hallType",
+                            "language",
+                            "date",
+                            "time",
+                            "startAt",
+                            "endAt",
+                            "price",
+                        ]
+                        if showtime.get(key) not in [None, ""]
+                    }
+                )
+                return AgentPlan(
+                    action="get_seats",
+                    reason="用户授权从当前场次中自动选择最早可售场次",
+                    params=params,
+                    state="selecting_seats",
+                )
+        if (
+            tr.flow == "book_ticket"
+            and slots.get("autoSelectShowtime")
+            and not movie_name
+            and not slots.get("movieId")
+        ):
+            movie = self._auto_selectable_movie_candidate(state)
+            if movie:
+                params = self._pick(
+                    slots,
+                    [
+                        "date",
+                        "timeRange",
+                        "ticketCount",
+                        "cinemaId",
+                        "cinemaName",
+                        "hallType",
+                        "notHallType",
+                        "maxPrice",
+                        "pricePreference",
+                        "timePreference",
+                        "location",
+                        "nearbyFirst",
+                        "autoSelectShowtime",
+                        "autoSelectSeats",
+                        "skipSnacks",
+                    ],
+                )
+                params["movieId"] = movie.get("movieId")
+                params["movieName"] = movie.get("movieName")
+                return AgentPlan(
+                    action="search_showtimes",
+                    reason="用户授权从当前推荐影片中自动选片并选场",
+                    params=params,
+                    state="selecting_showtime",
+                )
+
         if (
             tr.flow == "book_ticket"
             and movie_name
@@ -551,6 +663,9 @@ class TaskPlanner:
                             "maxPrice",
                             "seatPositions",
                             "excludeShowtimeId",
+                            "autoSelectShowtime",
+                            "autoSelectSeats",
+                            "skipSnacks",
                         ],
                     ),
                     state="selecting_showtime",
@@ -585,7 +700,8 @@ class TaskPlanner:
                     params=self._pick(slots, ["movieName", "movieId", "date", "timeRange",
                         "ticketCount", "cinemaId", "cinemaName", "hallType",
                         "notHallType", "maxPrice", "seatPositions",
-                        "snackRequests"]),
+                        "snackRequests", "autoSelectShowtime", "autoSelectSeats",
+                        "skipSnacks"]),
                     state="selecting_showtime",
                 )
             return AgentPlan(
@@ -593,7 +709,8 @@ class TaskPlanner:
                 reason="先搜电影让用户选",
                 params=self._pick(slots, ["movieName", "genre", "date", "timeRange",
                     "ticketCount",
-                    "cinemaId", "cinemaName", "hallType", "recommendationCriteria"]),
+                    "cinemaId", "cinemaName", "hallType", "recommendationCriteria",
+                    "autoSelectShowtime", "autoSelectSeats", "skipSnacks"]),
                 state="selecting_movie",
             )
 
@@ -611,6 +728,59 @@ class TaskPlanner:
             reason="购票流程无可用动作",
             params={"query": state.last_user_text},
             state="answering",
+        )
+
+    @staticmethod
+    def _auto_selectable_movie_candidate(
+        state: AgentState,
+    ) -> dict[str, Any] | None:
+        candidates = state.selected.get("movie_candidates") or []
+        if not isinstance(candidates, list):
+            return None
+
+        valid = [
+            movie
+            for movie in candidates
+            if isinstance(movie, dict)
+            and movie.get("movieId") not in [None, ""]
+            and movie.get("movieName") not in [None, ""]
+        ]
+        if not valid:
+            return None
+
+        return next(
+            (
+                movie
+                for movie in valid
+                if isinstance(movie.get("upcomingShowtimes"), list)
+                and movie["upcomingShowtimes"]
+            ),
+            valid[0],
+        )
+
+    @staticmethod
+    def _auto_selectable_showtime_candidate(
+        state: AgentState,
+    ) -> dict[str, Any] | None:
+        candidates = state.selected.get("showtime_candidates") or []
+        if not isinstance(candidates, list):
+            return None
+
+        valid = [
+            showtime
+            for showtime in candidates
+            if isinstance(showtime, dict)
+            and showtime.get("showtimeId") not in [None, ""]
+        ]
+        if not valid:
+            return None
+
+        return min(
+            valid,
+            key=lambda item: str(
+                item.get("startAt")
+                or f"{item.get('date') or '9999-12-31'}T{item.get('time') or '23:59'}"
+            ),
         )
 
     @staticmethod

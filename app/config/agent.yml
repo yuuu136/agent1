@@ -39,7 +39,7 @@ llm:
 nlu:
   provider: qwen-turbo
   model: qwen-turbo
-  temperature: 0.5
+  temperature: 0
   max_tokens: 400
   timeout_seconds: 15
 
