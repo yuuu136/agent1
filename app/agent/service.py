@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from copy import deepcopy
+import secrets
 from datetime import datetime
 import json
 import re
@@ -508,6 +509,11 @@ class AgentService:
         if plan.action == "search_movies":
             state.selected.pop("movie_candidates", None)
             state.selected.pop("showtime_candidates", None)
+            state.selected.pop("seat_map", None)
+            state.selected.pop("order", None)
+            state.selected.pop("ticket", None)
+            state.selected.pop("calendar", None)
+            state.selected.pop("notification", None)
             # When search returns results with showtimes AND the user is asking
             # about a specific movie (not browsing), auto-fill date+time so
             # the user sees actual showtimes instead of being asked step by step.
@@ -593,9 +599,26 @@ class AgentService:
                 state.slots[key] = data[key]
 
         if plan.action == "search_showtimes" and result.success:
+            self._auto_select_showtime(state, plan, result)
+
+        if (
+            plan.action == "search_movies"
+            and result.success
+            and result.data.get("directShowtimes")
+        ):
+            self._auto_select_showtime(state, plan, result)
+
+        if plan.action == "search_showtimes" and result.success:
             self._auto_lock_explicit_seats(state, plan, result)
             if result.data.get("paymentReady"):
                 return
+
+        if (
+            plan.action == "get_seats"
+            and result.success
+            and plan.params.get("autoSelectSeats")
+        ):
+            self._auto_select_seats(state, plan, result)
 
         if (
             plan.action == "get_seats"
@@ -891,6 +914,15 @@ class AgentService:
             f"已按你的要求选择{'、'.join(self._seat_position_labels(positions))}，"
             "座位已锁定，订单已创建，可以直接支付。"
         )
+        if plan.params.get("skipSnacks") or state.slots.get("skipSnacks"):
+            state.slots.pop("skipSnacks", None)
+            state.slots.pop("snackRequests", None)
+            state.slots.pop("snackIds", None)
+            state.slots.pop("snackItems", None)
+            state.selected.pop("snack_candidates", None)
+            result.data["paymentReady"] = True
+            return
+
         if self._apply_requested_snacks_after_lock(
             state,
             result,
@@ -912,6 +944,208 @@ class AgentService:
         )
         if not offered:
             result.data["paymentReady"] = True
+
+    def _auto_select_seats(
+        self,
+        state: AgentState,
+        plan: AgentPlan,
+        result: ToolResult,
+    ) -> None:
+        """Choose sensible seats from the current seat map for a natural-language request."""
+        seats = result.data.get("seats") or []
+        preference = str(
+            plan.params.get("seatPreference")
+            or state.slots.get("seatPreference")
+            or "middle"
+        ).lower()
+        available_count = sum(
+            1
+            for seat in seats
+            if isinstance(seat, dict) and self._is_selectable_seat(seat)
+        )
+        ticket_count = (
+            available_count
+            if preference == "all"
+            else (
+                self._as_int(state.slots.get("ticketCount"))
+                or self._as_int(plan.params.get("ticketCount"))
+                or self._as_int(result.data.get("ticketCount"))
+                or 1
+            )
+        )
+        positions = self._choose_auto_seat_positions(
+            seats,
+            ticket_count,
+            preference,
+        )
+        if not positions:
+            result.message = (
+                f"当前只有{available_count}个可用座位，无法满足{ticket_count}张票。"
+                "请减少票数或换一场。"
+            )
+            result.suggestions = ["换一场", "重新选座"]
+            state.state = "selecting_seats"
+            state.pending_action = "get_seats"
+            return
+
+        state.slots["seatPositions"] = positions
+        state.slots["ticketCount"] = ticket_count
+        state.slots.pop("autoSelectSeats", None)
+        result.data["autoSelectedSeats"] = positions
+
+    def _choose_auto_seat_positions(
+        self,
+        seats: list[Any],
+        ticket_count: int,
+        preference: str = "middle",
+    ) -> list[dict[str, int]]:
+        if ticket_count <= 0:
+            return []
+
+        available: list[tuple[int, int]] = []
+        for seat in seats:
+            if not isinstance(seat, dict) or not self._is_selectable_seat(seat):
+                continue
+            row_no = self._seat_row(seat)
+            seat_no = self._seat_number(seat)
+            if row_no is not None and seat_no is not None:
+                available.append((row_no, seat_no))
+        available = sorted(set(available))
+        if len(available) < ticket_count:
+            return []
+        if preference == "all":
+            return [
+                {"rowNo": row_no, "seatNo": seat_no}
+                for row_no, seat_no in available
+            ]
+
+        rows = sorted({row_no for row_no, _ in available})
+        numbers = [seat_no for _, seat_no in available]
+        min_row, max_row = min(rows), max(rows)
+        min_number, max_number = min(numbers), max(numbers)
+        if preference == "front":
+            target_row = float(min_row)
+        elif preference == "back":
+            target_row = float(max_row)
+        else:
+            target_row = (min_row + max_row) / 2
+        target_number = (min_number + max_number) / 2
+
+        by_row: dict[int, list[int]] = {}
+        for row_no, seat_no in available:
+            by_row.setdefault(row_no, []).append(seat_no)
+
+        candidates: list[
+            tuple[tuple[float, float, int, int], list[tuple[int, int]]]
+        ] = []
+        for row_no, row_numbers in by_row.items():
+            row_numbers.sort()
+            for start in range(0, len(row_numbers) - ticket_count + 1):
+                window = row_numbers[start:start + ticket_count]
+                if any(
+                    window[index] + 1 != window[index + 1]
+                    for index in range(len(window) - 1)
+                ):
+                    continue
+                block_center = (window[0] + window[-1]) / 2
+                candidates.append(
+                    (
+                        (
+                            abs(row_no - target_row),
+                            abs(block_center - target_number),
+                            row_no,
+                            window[0],
+                        ),
+                        [(row_no, seat_no) for seat_no in window],
+                    )
+                )
+
+        if preference == "random":
+            if candidates:
+                chosen = secrets.choice(candidates)[1]
+            else:
+                chosen = secrets.SystemRandom().sample(available, ticket_count)
+                chosen.sort()
+            return [
+                {"rowNo": row_no, "seatNo": seat_no}
+                for row_no, seat_no in chosen
+            ]
+
+        if candidates:
+            chosen = min(candidates, key=lambda item: item[0])[1]
+        else:
+            # A non-contiguous fallback is preferable to dropping the current
+            # seat-selection context when the hall has no remaining row block.
+            chosen = sorted(
+                available,
+                key=lambda item: (
+                    abs(item[0] - target_row),
+                    abs(item[1] - target_number),
+                    item[0],
+                    item[1],
+                ),
+            )[:ticket_count]
+
+        return [
+            {"rowNo": row_no, "seatNo": seat_no}
+            for row_no, seat_no in chosen
+        ]
+
+    def _auto_select_showtime(
+        self,
+        state: AgentState,
+        plan: AgentPlan,
+        result: ToolResult,
+    ) -> None:
+        if not plan.params.get("autoSelectShowtime"):
+            return
+
+        showtimes = result.data.get("showtimes") or []
+        showtime = next(
+            (
+                item
+                for item in showtimes
+                if isinstance(item, dict) and item.get("showtimeId") not in [None, ""]
+            ),
+            None,
+        )
+        if not showtime:
+            return
+
+        showtime_id = showtime["showtimeId"]
+        self._remember_showtime_context(state, showtime)
+        state.slots.pop("autoSelectShowtime", None)
+        state.selected.pop("showtime_candidates", None)
+
+        seat_params = {
+            **plan.params,
+            **showtime,
+            "showtimeId": showtime_id,
+        }
+        seat_params.pop("autoSelectShowtime", None)
+        seat_plan = AgentPlan(
+            action="get_seats",
+            reason="用户授权自动选择场次，直接进入选座",
+            params=seat_params,
+            state="selecting_seats",
+        )
+        seat_result = agent_toolbox.execute(seat_plan, state)
+
+        plan.action = seat_plan.action
+        plan.reason = seat_plan.reason
+        plan.params = seat_plan.params
+        plan.state = seat_plan.state
+        state.state = "selecting_seats"
+        state.pending_action = "get_seats"
+
+        result.tool_name = seat_result.tool_name
+        result.success = seat_result.success
+        result.data = deepcopy(seat_result.data)
+        result.message = seat_result.message
+        result.cards = seat_result.cards
+        result.suggestions = seat_result.suggestions
+        if "seats" in result.data:
+            state.selected["seat_map"] = result.data
 
     def _remember_showtime_context(
         self,
@@ -1303,15 +1537,15 @@ class AgentService:
         if plan.action == "pay_order":
             if result.data.get("ticketStatus") == "issued" or str(result.data.get("status", "")).upper() == "TICKETED":
                 return "支付成功，电子票已出票。"
-            if result.data.get("qrCode"):
-                return "支付二维码已生成，请扫码支付。"
             if str(result.data.get("paymentStatus", "")).upper() == "SUCCESS":
                 return "支付成功。"
+            if result.data.get("payForm"):
+                return "支付宝支付页面已生成，请点击“去支付宝付款”完成支付。"
         return {
             "confirm_selection": "请确认当前选择。",
             "lock_seats": "座位已锁定，可以创建订单。",
             "create_order": "订单已创建。",
-            "pay_order": "支付二维码已生成，请扫码支付。",
+            "pay_order": "支付宝支付页面已生成，请点击“去支付宝付款”完成支付。",
             "cancel": "已取消当前购票流程。",
         }.get(plan.action, "已完成当前步骤。")
 

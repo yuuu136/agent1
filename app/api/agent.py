@@ -75,6 +75,7 @@ def _message_deltas(trace_id: str, content: str) -> Iterator[str]:
 
 def _stream_response(request: StreamChatRequest) -> Iterator[str]:
     trace_id = str(uuid.uuid4())
+    terminal_sent = False
 
     try:
         payload: dict[str, Any] = {}
@@ -129,6 +130,7 @@ def _stream_response(request: StreamChatRequest) -> Iterator[str]:
                         "memoryId": response.session.get("memoryId"),
                     },
                 )
+                terminal_sent = True
                 continue
 
             if node_name == "greeting":
@@ -142,6 +144,7 @@ def _stream_response(request: StreamChatRequest) -> Iterator[str]:
                         "memoryId": response.session.get("memoryId"),
                     },
                 )
+                terminal_sent = True
                 continue
 
             completed.append(node_name)
@@ -170,6 +173,14 @@ def _stream_response(request: StreamChatRequest) -> Iterator[str]:
                 "detail": str(exc),
             },
         )
+        if not terminal_sent:
+            yield _event(
+                "done",
+                {
+                    "traceId": trace_id,
+                    "state": "error",
+                },
+            )
 
 
 @router.post("/chat/stream")

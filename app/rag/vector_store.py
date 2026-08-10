@@ -85,14 +85,26 @@ class ChromaVectorStore:
         top_k: int,
         score_threshold: float = 0.0,
     ) -> list[RetrievedChunk]:
-        if not query_embedding or top_k <= 0 or self.collection.count() == 0:
+        if not query_embedding or top_k <= 0 or self._collection_count() == 0:
             return []
 
-        payload = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"],
-        )
+        try:
+            payload = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception as exc:
+            if not self._is_missing_collection_error(exc):
+                raise
+            self.collection = self._get_or_create_collection()
+            if self._collection_count() == 0:
+                return []
+            payload = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
         ids = payload.get("ids", [[]])[0]
         documents = payload.get("documents", [[]])[0]
         metadatas = payload.get("metadatas", [[]])[0]
@@ -119,20 +131,39 @@ class ChromaVectorStore:
         return results
 
     def count(self) -> int:
-        return self.collection.count()
+        return self._collection_count()
 
     def _replace_collection(self, metadata: dict[str, Any]) -> None:
+        """Replace documents without invalidating handles held by other processes."""
+        self.collection = self._get_or_create_collection()
         try:
-            self.client.delete_collection(self.collection_name)
-        except ValueError:
-            pass
-        self.collection = self.client.create_collection(
-            name=self.collection_name,
-            metadata={
-                "hnsw:space": self.distance_metric,
-                **to_chroma_metadata(metadata),
-            },
-        )
+            existing = self.collection.get(include=[])
+            ids = existing.get("ids") or []
+            if ids:
+                self.collection.delete(ids=ids)
+        except Exception as exc:
+            if not self._is_missing_collection_error(exc):
+                raise
+            self.collection = self._get_or_create_collection()
+
+        # Chroma rejects hnsw:space in modify(), even when the value is
+        # unchanged. The distance metric was already fixed at creation time.
+        normalized_metadata = to_chroma_metadata(metadata)
+        if normalized_metadata:
+            self.collection.modify(metadata=normalized_metadata)
+
+    def _collection_count(self) -> int:
+        try:
+            return self.collection.count()
+        except Exception as exc:
+            if not self._is_missing_collection_error(exc):
+                raise
+            self.collection = self._get_or_create_collection()
+            return self.collection.count()
+
+    @staticmethod
+    def _is_missing_collection_error(exc: Exception) -> bool:
+        return "does not exist" in str(exc).lower()
 
     def _distance_to_score(self, distance: float) -> float:
         if self.distance_metric == "cosine":

@@ -1,7 +1,7 @@
 ﻿import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -77,6 +77,7 @@ class SpringBootMovieTicketMCP:
             )
 
     def search_movies(self, arguments: dict[str, Any]) -> ToolResult:
+        arguments = self._with_resolved_cinema_id(arguments)
         keyword = arguments.get("movieName") or arguments.get("keyword")
         cinema_id = arguments.get("cinemaId")
         recommendation_criteria = arguments.get("recommendationCriteria")
@@ -170,8 +171,62 @@ class SpringBootMovieTicketMCP:
             genre=arguments.get("genre"),
         )
         movies = self._filter_movies(all_movies, keyword, genre, actor)
+        if (
+            recommendation_criteria
+            and not self._has_showtime_constraints(arguments)
+            and not arguments.get("cinemaId")
+            and not keyword
+            and not genre
+            and not actor
+        ):
+            available_movies = self._exclude_unreleased_movies(movies)
+            available_movies = self._rank_recommended_movies(
+                available_movies,
+                recommendation_criteria,
+            )
+            fallback_reason = None
+            if (
+                recommendation_criteria == "family"
+                and not self._has_recommendation_genre_match(
+                    available_movies,
+                    "family",
+                )
+            ):
+                upcoming_family_movies = self._upcoming_recommendation_movie_cards(
+                    movies,
+                    "family",
+                )
+                if upcoming_family_movies:
+                    available_movies = upcoming_family_movies
+                    fallback_reason = "upcoming_family"
+            movies = self._apply_movie_limit(
+                available_movies,
+                arguments.get("movieLimit") or 3,
+            )
+            return ToolResult(
+                tool_name="spring_boot.search_movies",
+                data={
+                    "movies": movies,
+                    "recommendationCriteria": recommendation_criteria,
+                    "fallbackReason": fallback_reason,
+                    "source": "spring_boot_database",
+                },
+                message=self._fallback_movie_search_message(
+                    fallback_reason,
+                    arguments,
+                    movies,
+                ) or self._movie_search_message(
+                    movies,
+                    recommendation_criteria,
+                ),
+                suggestions=self._browse_suggestions(movies, arguments),
+            )
         movies = self._enrich_movie_cards_with_showtimes(movies, arguments)
         movies = self._filter_movie_cards_by_showtime_constraints(movies, arguments)
+        if recommendation_criteria:
+            # Recommendations should not present future titles as currently
+            # watchable just because they have a later showtime.
+            movies = self._exclude_unreleased_movies(movies)
         if actor and not movies:
             return ToolResult(
                 tool_name="spring_boot.search_movies",
@@ -180,13 +235,18 @@ class SpringBootMovieTicketMCP:
                 suggestions=["最近热映", "推荐一部喜剧", "附近有什么影院"],
             )
         fallback_reason = None
+        if not movies and recommendation_criteria and not actor and not genre:
+            movies, fallback_reason = self._fallback_recommendation_movie_cards(
+                arguments,
+            )
         if not movies:
-            movies, fallback_reason = self._fallback_movie_cards(
+            movies, standard_fallback_reason = self._fallback_movie_cards(
                 arguments,
                 all_movies,
             )
+            fallback_reason = fallback_reason or standard_fallback_reason
         # Keyword/genre search got nothing → show all available movies
-        if not movies and not fallback_reason and (keyword or arguments.get("genre") or arguments.get("movieName")):
+        if not movies and not fallback_reason and (keyword or arguments.get("movieName")):
             movies = self._load_movie_cards(arguments, keyword=None, genre=None)
             movies = self._enrich_movie_cards_with_showtimes(movies, arguments)
             movies = self._filter_movie_cards_by_showtime_constraints(movies, arguments)
@@ -221,21 +281,38 @@ class SpringBootMovieTicketMCP:
         )
 
     def search_showtimes(self, arguments: dict[str, Any]) -> ToolResult:
+        arguments = self._with_resolved_cinema_id(arguments)
         movie_id = arguments.get("movieId")
         movie_name = str(arguments.get("movieName") or "").strip()
         movie_ids: list[Any] = []
 
         if not movie_id and movie_name:
-            movie_result = self.search_movies({**arguments, "keyword": movie_name})
+            movie_result = self.search_movies(
+                {
+                    **arguments,
+                    "keyword": movie_name,
+                    "resolveMovieOnly": True,
+                }
+            )
             if not movie_result.success:
                 return movie_result
             movies = movie_result.data.get("movies", [])
             movie = self._pick_movie(movies, movie_name)
             if not movie:
+                cinema_showtimes = self._load_matching_showtimes_without_movie_id(
+                    arguments,
+                    movie_name,
+                    self._spring_date(arguments.get("date")),
+                )
+                if cinema_showtimes:
+                    return self._showtime_result(arguments, cinema_showtimes)
                 return ToolResult(
                     tool_name="spring_boot.search_showtimes",
                     data={"showtimes": [], "movies": movies},
-                    message=f"没有找到《{movie_name}》的相关信息。",
+                    message=(
+                        f"没有找到《{movie_name}》的相关信息。"
+                        "该影片可能暂未上映或当前没有排片。"
+                    ),
                 )
             movie_id = movie.get("movieId")
         elif not movie_id and arguments.get("genre"):
@@ -264,10 +341,26 @@ class SpringBootMovieTicketMCP:
                 data={"error": "LOCATION_REQUIRED"},
                 message="需要获取你的位置，才能按最近影院为你找场次。",
             )
-        showtimes = self._search_showtimes_by_preference(
-            arguments,
-            query_movie_ids,
-            date_value,
+        if any(value not in [None, ""] for value in query_movie_ids):
+            showtimes = self._search_showtimes_by_preference(
+                arguments,
+                query_movie_ids,
+                date_value,
+            )
+        else:
+            showtimes = self._load_showtimes_without_movie_id(arguments, date_value)
+            showtimes = self._filter_showtimes(
+                showtimes,
+                date_value,
+                arguments.get("timeRange"),
+                arguments.get("ticketCount"),
+                arguments.get("pricePreference"),
+                arguments.get("timePreference"),
+                arguments.get("excludeShowtimeId"),
+            )
+        showtimes = self._filter_showtimes_by_hall_type(
+            showtimes,
+            arguments.get("hallType"),
         )
         showtime_limit = self._positive_int(arguments.get("showtimeLimit"))
         if showtime_limit:
@@ -287,6 +380,18 @@ class SpringBootMovieTicketMCP:
                 "subtitle": self._showtime_subtitle(showtime),
                 "label": "进入选座",
             }
+        return self._showtime_result(arguments, showtimes, response_data)
+
+    def _showtime_result(
+        self,
+        arguments: dict[str, Any],
+        showtimes: list[dict[str, Any]],
+        response_data: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        response_data = response_data or {
+            "showtimes": showtimes,
+            "source": "spring_boot_database",
+        }
         return ToolResult(
             tool_name="spring_boot.search_showtimes",
             data=response_data,
@@ -298,6 +403,74 @@ class SpringBootMovieTicketMCP:
             ),
         )
 
+    def _load_matching_showtimes_without_movie_id(
+        self,
+        arguments: dict[str, Any],
+        movie_name: str,
+        date_value: str | None,
+    ) -> list[dict[str, Any]]:
+        if arguments.get("cinemaId") in [None, ""]:
+            return []
+        showtimes = self._load_showtimes_without_movie_id(arguments, date_value)
+        normalized_name = self._normalize_match_text(movie_name)
+        if normalized_name:
+            showtimes = [
+                item
+                for item in showtimes
+                if normalized_name in self._normalize_match_text(item.get("movieName"))
+                or self._normalize_match_text(item.get("movieName")) in normalized_name
+            ]
+        return self._filter_showtimes(
+            showtimes,
+            date_value,
+            arguments.get("timeRange"),
+            arguments.get("ticketCount"),
+            arguments.get("pricePreference"),
+            arguments.get("timePreference"),
+            arguments.get("excludeShowtimeId"),
+        )
+
+    def _load_showtimes_without_movie_id(
+        self,
+        arguments: dict[str, Any],
+        date_value: str | None,
+    ) -> list[dict[str, Any]]:
+        if date_value is not None:
+            data = self._get_business(
+                "/api/user/showtimes",
+                arguments,
+                {
+                    "cinemaId": arguments.get("cinemaId"),
+                    "date": date_value,
+                    "hallType": arguments.get("hallType"),
+                },
+            )
+            return self._format_showtime_groups(data)
+
+        days = self._positive_int(arguments.get("lookaheadDays")) or 7
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        combined: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for offset in range(days):
+            day = (today + timedelta(days=offset)).isoformat()
+            data = self._get_business(
+                "/api/user/showtimes",
+                arguments,
+                {
+                    "cinemaId": arguments.get("cinemaId"),
+                    "date": day,
+                    "hallType": arguments.get("hallType"),
+                },
+            )
+            for showtime in self._format_showtime_groups(data):
+                key = str(showtime.get("showtimeId") or "")
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                combined.append(showtime)
+        return combined
+
     def _search_showtimes_by_preference(
         self,
         arguments: dict[str, Any],
@@ -308,10 +481,15 @@ class SpringBootMovieTicketMCP:
         nearby_first = bool(arguments.get("nearbyFirst"))
         has_cinema = arguments.get("cinemaId") not in [None, ""]
         if nearby_first and not has_cinema:
+            # A nearby-cinema browse can stay within 5 km, but a request for a
+            # specific movie should keep looking until it finds the nearest
+            # cinema that actually has that movie on sale.
+            search_radius = self._positive_int(arguments.get("radius")) or 20
             nearby = self.search_nearby_cinemas(
                 {
                     **arguments,
                     "cinemaLimit": self._positive_int(arguments.get("cinemaLimit")) or 5,
+                    "radius": search_radius,
                 }
             )
             if not nearby.success:
@@ -393,12 +571,13 @@ class SpringBootMovieTicketMCP:
         seen: set[str] = set()
         for offset in range(days):
             date_value = (today + timedelta(days=offset)).isoformat()
-            for showtime in self._load_showtimes_for_cinema(
+            daily_showtimes = self._load_showtimes_for_cinema(
                 arguments,
                 query_movie_ids,
                 date_value,
                 cinema_id,
-            ):
+            )
+            for showtime in daily_showtimes:
                 key = str(showtime.get("showtimeId") or "")
                 if not key:
                     key = "|".join(
@@ -409,6 +588,11 @@ class SpringBootMovieTicketMCP:
                     continue
                 seen.add(key)
                 combined.append(showtime)
+            if (
+                daily_showtimes
+                and arguments.get("timePreference") == "earliest"
+            ):
+                return daily_showtimes
         combined.sort(key=self._showtime_start_sort_key)
         return combined
 
@@ -636,10 +820,10 @@ class SpringBootMovieTicketMCP:
             {"idempotencyKey": idempotency_key},
         )
         payment_status = str(raw.get("paymentStatus") or raw.get("status") or "").upper()
-        qr_code = str(raw.get("qrCode") or raw.get("payForm") or "").strip()
+        pay_form = str(raw.get("payForm") or "").strip()
 
-        if payment_status != "SUCCESS" and not qr_code:
-            raise ValueError("支付宝沙箱二维码未返回。")
+        if payment_status != "SUCCESS" and not pay_form:
+            raise ValueError("支付宝沙箱支付表单未返回。")
 
         order_result = self.get_order({**arguments, "orderId": order_id})
         data = dict(order_result.data)
@@ -651,7 +835,7 @@ class SpringBootMovieTicketMCP:
             "paymentStatus": payment_status or "PENDING",
             "status": data.get("status") or ("PAYMENT_PENDING" if payment_status != "SUCCESS" else "SUCCESS"),
             "paidAmount": data.get("amount"),
-            "qrCode": qr_code or None,
+            "payForm": pay_form or None,
             "ticketStatus": ticket_status,
             "ticketCodes": [
                 item.get("ticketCode")
@@ -668,7 +852,7 @@ class SpringBootMovieTicketMCP:
                 if data["ticketStatus"] == "issued"
                 else "支付成功！"
                 if payment_status == "SUCCESS"
-                else "二维码已生成，扫码就能支付。"
+                else "支付宝支付页面已生成，请点击“去支付宝付款”完成支付。"
             ),
         )
 
@@ -759,6 +943,13 @@ class SpringBootMovieTicketMCP:
         )
         records = data.get("records") or []
         cinemas = [self._format_cinema(item) for item in records]
+        hall_type = str(arguments.get("hallType") or "").strip()
+        if hall_type:
+            cinemas = [
+                cinema
+                for cinema in cinemas
+                if self._cinema_supports_hall_type(cinema, hall_type)
+            ]
         return ToolResult(
             tool_name="spring_boot.search_nearby_cinemas",
             data={
@@ -773,6 +964,25 @@ class SpringBootMovieTicketMCP:
                 else "当前位置附近暂时没有匹配到影院。"
             ),
         )
+
+    @staticmethod
+    def _cinema_supports_hall_type(
+        cinema: dict[str, Any],
+        hall_type: str,
+    ) -> bool:
+        def values(value: Any) -> list[str]:
+            if isinstance(value, (list, tuple, set)):
+                return [str(item) for item in value]
+            if value in [None, ""]:
+                return []
+            return [str(value)]
+
+        target = hall_type.casefold()
+        supported = [
+            *values(cinema.get("services")),
+            *values(cinema.get("hallTypes")),
+        ]
+        return any(target in value.casefold() for value in supported)
 
     def _split_location(self, location: str) -> tuple[float, float]:
         parts = [part.strip() for part in location.split(",")]
@@ -1041,6 +1251,48 @@ class SpringBootMovieTicketMCP:
             raise ValueError(message)
         return payload.get("data") or {}
 
+    def _with_resolved_cinema_id(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if arguments.get("cinemaId") not in [None, ""]:
+            return arguments
+        cinema_name = str(arguments.get("cinemaName") or "").strip()
+        if not cinema_name:
+            return arguments
+        cinema = self._resolve_cinema_by_name(arguments, cinema_name)
+        if not cinema or cinema.get("cinemaId") in [None, ""]:
+            return arguments
+        resolved = dict(arguments)
+        resolved["cinemaId"] = cinema.get("cinemaId")
+        resolved["cinemaName"] = cinema.get("cinemaName") or cinema_name
+        return resolved
+
+    def _resolve_cinema_by_name(
+        self,
+        arguments: dict[str, Any],
+        cinema_name: str,
+    ) -> dict[str, Any] | None:
+        try:
+            data = self._get_business(
+                "/api/user/cinemas",
+                arguments,
+                {"page": 1, "size": 20, "keyword": cinema_name},
+            )
+        except Exception:
+            return None
+
+        records = [self._format_cinema(item) for item in data.get("records") or []]
+        if not records:
+            return None
+
+        target = self._normalize_match_text(cinema_name)
+        for item in records:
+            if self._normalize_match_text(item.get("cinemaName")) == target:
+                return item
+        for item in records:
+            actual = self._normalize_match_text(item.get("cinemaName"))
+            if target in actual or actual in target:
+                return item
+        return records[0]
+
     def _post_business(
         self,
         path: str,
@@ -1105,11 +1357,20 @@ class SpringBootMovieTicketMCP:
         movies: list[dict[str, Any]],
         arguments: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        if not movies:
+        if not movies or arguments.get("resolveMovieOnly"):
             return movies
         should_enrich = any(
             arguments.get(key)
-            for key in ["movieName", "keyword", "cinemaId", "date", "timeRange", "ticketCount", "hallType"]
+            for key in [
+                "movieName",
+                "keyword",
+                "cinemaId",
+                "date",
+                "timeRange",
+                "ticketCount",
+                "hallType",
+                "recommendationCriteria",
+            ]
         )
         if not should_enrich:
             return movies
@@ -1158,11 +1419,12 @@ class SpringBootMovieTicketMCP:
         if not self._has_showtime_constraints(arguments):
             return [], None
 
-        today_movies = self._today_high_rating_fallback(arguments)
-        today_movies = self._exclude_requested_movie(today_movies, arguments)
-        today_movies = self._exclude_unreleased_movies(today_movies)
-        if today_movies:
-            return today_movies, "today_high_rating"
+        if not arguments.get("genre"):
+            today_movies = self._today_high_rating_fallback(arguments)
+            today_movies = self._exclude_requested_movie(today_movies, arguments)
+            today_movies = self._exclude_unreleased_movies(today_movies)
+            if today_movies:
+                return today_movies, "today_high_rating"
 
         tomorrow_movies = self._tomorrow_same_type_fallback(
             arguments,
@@ -1173,6 +1435,100 @@ class SpringBootMovieTicketMCP:
             return tomorrow_movies, "tomorrow_same_type"
 
         return [], None
+
+    def _fallback_recommendation_movie_cards(
+        self,
+        arguments: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Use actual sellable showtimes when the movie catalog has no current results."""
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        tomorrow = today + timedelta(days=1)
+        requested_date = self._spring_date(arguments.get("date"))
+        candidate_dates = (
+            [requested_date]
+            if requested_date
+            else [today.isoformat(), tomorrow.isoformat()]
+        )
+        if requested_date == today.isoformat():
+            candidate_dates.append(tomorrow.isoformat())
+
+        for date_value in candidate_dates:
+            search_arguments = {**arguments, "date": date_value}
+            movies = self._available_movie_cards_for_date(search_arguments, date_value)
+            movies = self._rank_recommended_movies(
+                movies,
+                arguments.get("recommendationCriteria"),
+            )
+            movies = self._apply_movie_limit(
+                movies,
+                arguments.get("movieLimit") or 3,
+            )
+            if not movies:
+                continue
+
+            is_tomorrow_fallback = (
+                date_value == tomorrow.isoformat()
+                and requested_date != tomorrow.isoformat()
+            )
+            return movies, "tomorrow_available" if is_tomorrow_fallback else None
+
+        return [], None
+
+    def _available_movie_cards_for_date(
+        self,
+        arguments: dict[str, Any],
+        date_value: str,
+    ) -> list[dict[str, Any]]:
+        data = self._get_business(
+            "/api/user/showtimes",
+            arguments,
+            {
+                "cinemaId": arguments.get("cinemaId"),
+                "date": date_value,
+                "hallType": arguments.get("hallType"),
+            },
+        )
+        movies = self._format_showtime_movies(data, arguments)
+        if not movies:
+            return []
+
+        catalog_data = self._get_business(
+            "/api/user/movies",
+            arguments,
+            {"page": 1, "size": 100},
+        )
+        metadata_by_id = {
+            str(movie.get("movieId")): movie
+            for movie in (
+                self._format_movie(item)
+                for item in catalog_data.get("records") or []
+                if isinstance(item, dict)
+            )
+            if movie.get("movieId") not in [None, ""]
+        }
+
+        merged_movies: list[dict[str, Any]] = []
+        for movie in movies:
+            metadata = metadata_by_id.get(str(movie.get("movieId"))) or {}
+            merged = dict(metadata)
+            merged.update(movie)
+            for key in [
+                "genre",
+                "score",
+                "cast",
+                "durationMinutes",
+                "poster",
+                "posterUrl",
+                "status",
+            ]:
+                if merged.get(key) in [None, ""] and metadata.get(key) not in [None, ""]:
+                    merged[key] = metadata[key]
+            merged_movies.append(merged)
+
+        return self._filter_movie_cards_by_showtime_constraints(
+            merged_movies,
+            arguments,
+        )
 
     def _fallback_cinema_movie_cards(
         self,
@@ -1299,15 +1655,50 @@ class SpringBootMovieTicketMCP:
     def _exclude_unreleased_movies(
         movies: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        unreleased_markers = ("待上映", "未上映", "COMING_SOON")
         return [
             movie
             for movie in movies
-            if not any(
-                marker in str(movie.get("status") or "").upper()
-                for marker in unreleased_markers
-            )
+            if not SpringBootMovieTicketMCP._is_unreleased_movie(movie)
         ]
+
+    @staticmethod
+    def _is_unreleased_movie(movie: dict[str, Any]) -> bool:
+        unreleased_markers = ("待上映", "未上映", "COMING_SOON")
+        return any(
+            marker in str(movie.get("status") or "").upper()
+            for marker in unreleased_markers
+        )
+
+    def _upcoming_recommendation_movie_cards(
+        self,
+        movies: list[dict[str, Any]],
+        criteria: str,
+    ) -> list[dict[str, Any]]:
+        """Return genre-matched unreleased titles only when a future date is known."""
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        upcoming: list[dict[str, Any]] = []
+        for movie in movies:
+            if (
+                not self._is_unreleased_movie(movie)
+                or not self._has_recommendation_genre_match([movie], criteria)
+                or not self._movie_has_future_showtime(movie, today)
+            ):
+                continue
+            upcoming.append(movie)
+        return self._rank_recommended_movies(upcoming, criteria)
+
+    @staticmethod
+    def _movie_has_future_showtime(movie: dict[str, Any], today: date) -> bool:
+        for showtime in movie.get("upcomingShowtimes") or []:
+            if not isinstance(showtime, dict):
+                continue
+            start_at = str(showtime.get("startAt") or showtime.get("date") or "")
+            try:
+                if date.fromisoformat(start_at[:10]) >= today:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _exclude_requested_movie(
         self,
@@ -1395,12 +1786,20 @@ class SpringBootMovieTicketMCP:
             formatted_showtimes = [
                 {
                     "showtimeId": item.get("id") or item.get("showtimeId"),
+                    "movieId": group.get("id") or group.get("movieId"),
+                    # These showtimes can be promoted directly to cards after a
+                    # single-movie recommendation, so they must carry the
+                    # movie label instead of relying on the outer movie card.
+                    "movieName": group.get("name") or group.get("movieName"),
                     "cinemaName": self._item_cinema_name(item, cinema, arguments),
                     "cinemaId": self._item_cinema_id(item, cinema, arguments),
                     "hallName": item.get("hallName"),
+                    "hallType": item.get("hallType"),
+                    "language": item.get("language"),
                     "startAt": item.get("startAt"),
                     "date": str(item.get("startAt") or "")[:10],
                     "time": str(item.get("startAt") or "")[11:16],
+                    "endAt": item.get("endAt"),
                     "price": self._cents_to_yuan(
                         item.get("basePrice")
                         if item.get("basePrice") not in [None, ""]
@@ -1533,7 +1932,7 @@ class SpringBootMovieTicketMCP:
             movie_cast = str(movie.get("cast") or "").casefold()
             if normalized_keyword and normalized_keyword not in movie_name:
                 continue
-            if normalized_genre and movie_genre and normalized_genre not in movie_genre:
+            if normalized_genre and normalized_genre not in movie_genre:
                 continue
             if normalized_actor and normalized_actor not in movie_cast:
                 continue
@@ -1551,7 +1950,7 @@ class SpringBootMovieTicketMCP:
 
         genre_ranks = {
             "couple": {"爱情": 3, "喜剧": 2, "动画": 1},
-            "family": {"动画": 3, "喜剧": 2, "爱情": 1},
+            "family": {"动画": 3, "喜剧": 2, "家庭": 1},
         }
 
         def number(movie: dict[str, Any], *keys: str) -> float:
@@ -1629,7 +2028,31 @@ class SpringBootMovieTicketMCP:
                 return f"{cinema_name}暂时没有正在上映的影片，看看其他影院？"
             return "当前没有正在上映的影片。过几天再来看看吧。"
 
-        head = self._movie_search_head(count, genre_label, keyword_label, criteria, cinema_name, has_showtimes, date_label)
+        criteria_label = str(criteria or "").strip()
+        if criteria_label == "couple" and not self._has_recommendation_genre_match(
+            movies, "couple"
+        ):
+            head = (
+                "当前可购场次里暂没有爱情、喜剧或动画片，"
+                f"先按评分为你推荐 {count} 部影片"
+            )
+        elif criteria_label == "family" and not self._has_recommendation_genre_match(
+            movies, "family"
+        ):
+            head = (
+                "当前可购场次里暂没有动画、喜剧或家庭片，"
+                f"先按评分为你推荐 {count} 部影片"
+            )
+        else:
+            head = self._movie_search_head(
+                count,
+                genre_label,
+                keyword_label,
+                criteria,
+                cinema_name,
+                has_showtimes,
+                date_label,
+            )
         detail = self._movie_showtime_lines(movies)
         if detail:
             return f"{head}\n\n{detail}"
@@ -1664,6 +2087,24 @@ class SpringBootMovieTicketMCP:
                 message = f"没有找到{genre}类型的影片，看看这些怎么样"
             else:
                 message = "没有找到匹配的影片，这些也很棒"
+        elif fallback_reason == "tomorrow_available":
+            if arguments.get("recommendationCriteria") == "couple":
+                if self._has_recommendation_genre_match(movies, "couple"):
+                    message = "今天暂无可看的排片，先为你挑了明天适合情侣看的电影。"
+                else:
+                    message = (
+                        "今天暂无可看的排片，明天暂时也没有爱情、喜剧或动画片，"
+                        "先为你推荐可购的高分影片。"
+                    )
+            else:
+                message = "今天暂时没有可看的排片，先为你推荐明天可购的电影。"
+        elif fallback_reason == "upcoming_family":
+            earliest = self._earliest_showtime_date(movies)
+            date_hint = f"，最早将于 {earliest} 上映" if earliest else ""
+            message = (
+                "目前没有正在上映的动画、喜剧或家庭片。"
+                f"以下适合带孩子看的影片近期上映{date_hint}（待上映）。"
+            )
         else:
             return None
 
@@ -1682,7 +2123,14 @@ class SpringBootMovieTicketMCP:
     ) -> str:
         date_prefix = f"{date_label}" if date_label else ""
         criteria_label = str(criteria or "").strip()
-        is_recommend = criteria_label in ("hot", "high_rating", "new_release", "couple", "general")
+        is_recommend = criteria_label in (
+            "hot",
+            "high_rating",
+            "new_release",
+            "couple",
+            "family",
+            "general",
+        )
 
         # Recommendation style ("推荐几部" → natural language)
         if genre_label:
@@ -1697,6 +2145,37 @@ class SpringBootMovieTicketMCP:
         if date_label:
             return f"{date_label}有 {count} 部电影正在上映"
         return f"当前有 {count} 部电影正在上映"
+
+    @staticmethod
+    def _has_recommendation_genre_match(
+        movies: list[dict[str, Any]],
+        criteria: str,
+    ) -> bool:
+        genre_terms = {
+            "couple": ("爱情", "喜剧", "动画"),
+            "family": ("动画", "喜剧", "家庭"),
+        }.get(criteria, ())
+        return any(
+            any(term in str(movie.get("genre") or "") for term in genre_terms)
+            for movie in movies
+        )
+
+    @staticmethod
+    def _earliest_showtime_date(movies: list[dict[str, Any]]) -> str:
+        dates: list[date] = []
+        for movie in movies:
+            for showtime in movie.get("upcomingShowtimes") or []:
+                if not isinstance(showtime, dict):
+                    continue
+                start_at = str(showtime.get("startAt") or showtime.get("date") or "")
+                try:
+                    dates.append(date.fromisoformat(start_at[:10]))
+                except ValueError:
+                    continue
+        if not dates:
+            return ""
+        earliest = min(dates)
+        return f"{earliest.month}月{earliest.day}日"
 
     @classmethod
     def _movie_showtime_lines(cls, movies: list[dict[str, Any]]) -> str:
@@ -1781,13 +2260,28 @@ class SpringBootMovieTicketMCP:
         cinema = data.get("cinema") or {}
         showtimes: list[dict[str, Any]] = []
         for group in data.get("movies") or []:
+            movie = group.get("movie") if isinstance(group.get("movie"), dict) else {}
+            movie_id = (
+                group.get("id")
+                or group.get("movieId")
+                or group.get("movie_id")
+                or movie.get("id")
+                or movie.get("movieId")
+            )
+            movie_name = (
+                group.get("name")
+                or group.get("movieName")
+                or group.get("movie_name")
+                or movie.get("name")
+                or movie.get("movieName")
+            )
             for item in group.get("showtimes") or []:
                 start_at = item.get("startAt")
                 showtimes.append(
                     {
                         "showtimeId": item.get("id"),
-                        "movieId": group.get("id"),
-                        "movieName": group.get("name"),
+                        "movieId": movie_id,
+                        "movieName": movie_name,
                         "cinemaId": self._item_cinema_id(item, cinema, {}),
                         "cinemaName": self._item_cinema_name(item, cinema, {}),
                         "hallName": item.get("hallName"),
@@ -1904,6 +2398,21 @@ class SpringBootMovieTicketMCP:
         return filtered
 
     @staticmethod
+    def _filter_showtimes_by_hall_type(
+        showtimes: list[dict[str, Any]],
+        hall_type: Any,
+    ) -> list[dict[str, Any]]:
+        target = str(hall_type or "").strip().casefold()
+        if not target:
+            return showtimes
+        return [
+            showtime
+            for showtime in showtimes
+            if target in str(showtime.get("hallType") or "").casefold()
+            or target in str(showtime.get("hallName") or "").casefold()
+        ]
+
+    @staticmethod
     def _showtime_start_sort_key(showtime: dict[str, Any]) -> str:
         start_at = str(showtime.get("startAt") or "").strip()
         if start_at:
@@ -1967,7 +2476,10 @@ class SpringBootMovieTicketMCP:
                 distance = self._format_distance(showtimes[0].get("distance"))
                 suffix = f"（距你约{distance}）" if distance else ""
                 if arguments.get("showtimeLimit") == 1:
-                    return f"已为你找到{cinema_name}{suffix}最早可看的场次。"
+                    movie_name = str(showtimes[0].get("movieName") or arguments.get("movieName") or "")
+                    movie_label = f"《{movie_name}》" if movie_name else ""
+                    time_label = self._showtime_time_label(showtimes[0])
+                    return f"已为你找到{cinema_name}{suffix}{movie_label}最近可看的场次：{time_label}。"
                 return f"已优先选择{cinema_name}{suffix}，以下场次按开场时间从早到晚排列。"
             return f"为你找到了 {len(showtimes)} 个符合条件的场次。"
 
@@ -1987,6 +2499,31 @@ class SpringBootMovieTicketMCP:
         if distance < 1:
             return f"{distance * 1000:.0f}米"
         return f"{distance:.1f}公里"
+
+    @staticmethod
+    def _showtime_time_label(showtime: dict[str, Any]) -> str:
+        raw_date = str(showtime.get("date") or showtime.get("startAt") or "")[:10]
+        time_value = str(showtime.get("time") or "").strip()
+        if not time_value:
+            time_value = str(showtime.get("startAt") or "")[11:16]
+        if not raw_date:
+            return time_value or "待确认时间"
+
+        try:
+            show_date = date.fromisoformat(raw_date)
+        except ValueError:
+            return f"{raw_date} {time_value}".strip()
+
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        if show_date == today:
+            date_label = f"今天 {show_date.month}月{show_date.day}日"
+        elif show_date == today + timedelta(days=1):
+            date_label = f"明天 {show_date.month}月{show_date.day}日"
+        elif show_date == today + timedelta(days=2):
+            date_label = f"后天 {show_date.month}月{show_date.day}日"
+        else:
+            date_label = f"{show_date.month}月{show_date.day}日"
+        return f"{date_label} {time_value}".strip()
 
     @staticmethod
     def _positive_int(value: Any) -> int | None:

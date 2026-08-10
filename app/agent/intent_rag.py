@@ -98,6 +98,7 @@ class IntentRAGRetriever:
             float(settings.get("retry_backoff_seconds", 0.3)),
         )
         self._query_cache: dict[str, IntentMatch | None] = {}
+        self._candidate_cache: dict[str, tuple[IntentMatch, ...]] = {}
         self._query_cache_size = max(1, int(settings.get("query_cache_size", 256)))
         self.store = ChromaVectorStore(
             persist_directory=chroma_config.get("chroma", {}).get(
@@ -123,20 +124,30 @@ class IntentRAGRetriever:
         if cache_key in self._query_cache:
             return self._query_cache[cache_key]
 
+        match = self.select_match(self.retrieve_candidates(text))
+        self._remember_query(cache_key, match)
+        return match
+
+    def retrieve_candidates(self, text: str, limit: int = 3) -> list[IntentMatch]:
+        """Return the best distinct intent candidates for LLM arbitration."""
+        if not self.enabled:
+            return []
+
+        cache_key = text.strip()
+        cached = self._candidate_cache.get(cache_key)
+        if cached is not None:
+            return list(cached[:limit])
+
         query_vector = self._embed_query_with_retry(text)
         if not query_vector:
-            self._remember_query(cache_key, None)
-            return None
+            self._remember_candidates(cache_key, ())
+            return []
 
         retrieved = self.store.search(
             query_embedding=query_vector,
             top_k=self.top_k,
             score_threshold=0.0,
         )
-        if not retrieved:
-            self._remember_query(cache_key, None)
-            return None
-
         best_by_intent: dict[str, tuple[float, str]] = {}
         for item in retrieved:
             intent = str(item.metadata.get("intent") or "")
@@ -145,31 +156,38 @@ class IntentRAGRetriever:
             current = best_by_intent.get(intent)
             if current is None or item.score > current[0]:
                 best_by_intent[intent] = (item.score, item.content)
+
         ranked = sorted(
             best_by_intent.items(),
             key=lambda item: item[1][0],
             reverse=True,
         )
-        if not ranked:
-            self._remember_query(cache_key, None)
-            return None
+        matches = [
+            IntentMatch(
+                intent=intent,
+                score=score_and_example[0],
+                example=score_and_example[1],
+                runner_up_score=(
+                    ranked[index + 1][1][0]
+                    if index + 1 < len(ranked)
+                    else 0.0
+                ),
+            )
+            for index, (intent, score_and_example) in enumerate(ranked)
+        ]
+        self._remember_candidates(cache_key, tuple(matches))
+        return matches[:limit]
 
-        best_intent, (best_score, best_example) = ranked[0]
-        runner_up_score = ranked[1][1][0] if len(ranked) > 1 else 0.0
-        if best_score < self.score_threshold:
-            self._remember_query(cache_key, None)
+    def select_match(self, candidates: list[IntentMatch]) -> IntentMatch | None:
+        """Keep the strict single-result behavior for deterministic fallbacks."""
+        if not candidates:
             return None
-        if best_score - runner_up_score < self.margin_threshold:
-            self._remember_query(cache_key, None)
+        best = candidates[0]
+        if best.score < self.score_threshold:
             return None
-        match = IntentMatch(
-            intent=best_intent,
-            score=best_score,
-            example=best_example,
-            runner_up_score=runner_up_score,
-        )
-        self._remember_query(cache_key, match)
-        return match
+        if best.score - best.runner_up_score < self.margin_threshold:
+            return None
+        return best
 
     def _remember_query(
         self,
@@ -181,6 +199,17 @@ class IntentRAGRetriever:
         self._query_cache[cache_key] = value
         while len(self._query_cache) > self._query_cache_size:
             self._query_cache.pop(next(iter(self._query_cache)))
+
+    def _remember_candidates(
+        self,
+        cache_key: str,
+        value: tuple[IntentMatch, ...],
+    ) -> None:
+        if not cache_key:
+            return
+        self._candidate_cache[cache_key] = value
+        while len(self._candidate_cache) > self._query_cache_size:
+            self._candidate_cache.pop(next(iter(self._candidate_cache)))
 
     def _ensure_index(self) -> None:
         current_metadata = getattr(self.store.collection, "metadata", {}) or {}

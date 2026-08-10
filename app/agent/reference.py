@@ -27,6 +27,17 @@ class ReferenceResolver:
         slots = dict(nlu.slots)
         text = nlu.reference_text or state.last_user_text
 
+        if (
+            nlu.intent == "search_movies"
+            and not slots.get("movieName")
+            and not slots.get("movieId")
+            and (
+                slots.get("recommendationCriteria")
+                or slots.get("movieLimit") not in [None, ""]
+            )
+        ):
+            self._clear_movie_browse_context(state)
+
         if self._is_explicit_new_movie_request(state, nlu, slots, text):
             self._clear_previous_movie_context(slots)
 
@@ -242,6 +253,22 @@ class ReferenceResolver:
             "expiresAt",
         )
 
+    @staticmethod
+    def _clear_movie_browse_context(state: AgentState) -> None:
+        for key in [
+            "movie_candidates",
+            "showtime_candidates",
+            "cinema_candidates",
+            "seat_map",
+            "snack_candidates",
+            "coupon_candidates",
+            "order",
+            "ticket",
+            "calendar",
+            "notification",
+        ]:
+            state.selected.pop(key, None)
+
     def _is_explicit_new_movie_request(
         self,
         state: AgentState,
@@ -371,7 +398,7 @@ class ReferenceResolver:
         )
 
     def _is_change_seat_request(self, text: str) -> bool:
-        return any(word in text for word in ["座位", "选座", "位置"]) and any(
+        return any(word in text for word in ["座位", "选座", "位置", "座"]) and any(
             word in text
             for word in ["换", "改", "重新", "重选", "不要这个", "不要当前", "不想要这个"]
         )
