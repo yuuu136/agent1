@@ -344,12 +344,41 @@ class CardBuilder:
 
     def _order_actions(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         status = str(data.get("status") or "").upper()
+        status_desc = str(data.get("statusDesc") or data.get("status") or "")
         order_id = data.get("orderId") or data.get("orderNo")
         if not order_id:
             return []
-        actions: list[dict[str, Any]] = [
-            {"event": "get_order", "label": "查看订单", "payload": data}
-        ]
+        actions: list[dict[str, Any]] = []
+        if status in {
+            "PAYMENT_PENDING",
+            "PENDING",
+            "UNPAID",
+            "WAIT_PAY",
+            "WAITING_PAYMENT",
+            "CREATED",
+        } or "待支付" in status_desc:
+            actions.append(
+                {
+                    "event": "pay_order",
+                    "label": "去支付",
+                    "payload": {
+                        **data,
+                        "orderId": order_id,
+                    },
+                }
+            )
+        actions.append(
+            {
+                "event": "view_order",
+                "label": "查看订单",
+                "payload": {
+                    **data,
+                    "orderId": order_id,
+                    "path": f"/orders/{order_id}",
+                    "target": "order_detail",
+                },
+            }
+        )
         if status in {"TICKETED", "PAID", "SUCCESS"}:
             actions.append(
                 {
