@@ -12,7 +12,7 @@ from app.schemas.agent import AgentState, NLUResult
 FLOWS: dict[str, dict[str, Any]] = {
     "book_ticket": {
         "required": [],           # No hard requirement — book_ticket can
-        "ask_for": ["movieName", "date", "timeRange"],
+        "ask_for": ["movieName", "ticketCount", "date", "timeRange", "cinemaName", "seatPreference"],
         "execute": "search_movies",
         "description": "订票",
     },
@@ -44,11 +44,11 @@ FLOWS: dict[str, dict[str, Any]] = {
 
 # Ask-for order within each flow: first missing from this list gets asked.
 ASK_ORDER = ["movieName", "genre", "ticketCount", "date", "timeRange",
-             "cinemaName", "showtimeId", "seatIds"]
+             "cinemaName", "seatPreference", "showtimeId", "seatIds"]
 
 # Slots that are "informational" and never asked for directly.
 INFO_SLOTS = {"hallType", "seatPreference", "pricePreference", "timePreference",
-              "maxPrice", "notHallType", "recommendationCriteria",
+              "maxPrice", "notHallType", "seatType", "recommendationCriteria",
               "cinemaLimit", "movieLimit", "location", "city", "orderId",
               "snackIds", "snackItems", "snackRequests", "seatPositions",
               "cinemaId", "__clearSlots"}
@@ -122,6 +122,18 @@ class DialogueTracker:
                 if slot not in filled:
                     if slot == "movieName" and "genre" in filled:
                         continue  # genre is sufficient to search
+                    if slot == "cinemaName" and (
+                        "cinemaId" in filled
+                        or ("nearbyFirst" in filled and "location" in filled)
+                    ):
+                        continue
+                    if slot == "seatPreference" and (
+                        "seatPositions" in filled
+                        or "seatIds" in filled
+                        or "autoSelectSeats" in filled
+                        or "seatType" in filled
+                    ):
+                        continue
                     missing.append(slot)
 
         # Stage name

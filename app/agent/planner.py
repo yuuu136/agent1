@@ -134,12 +134,14 @@ class TaskPlanner:
                     "cinemaId",
                     "cinemaName",
                     "hallType",
+                    "maxPrice",
                     "pricePreference",
                     "timePreference",
                     "location",
                     "nearbyFirst",
                     "cinemaLimit",
                     "showtimeLimit",
+                    "seatType",
                     "seatPositions",
                     "excludeShowtimeId",
                     "autoSelectShowtime",
@@ -226,6 +228,7 @@ class TaskPlanner:
                         "nearbyFirst",
                         "cinemaLimit",
                         "showtimeLimit",
+                        "seatType",
                         "autoSelectShowtime",
                         "autoSelectSeats",
                         "skipSnacks",
@@ -381,7 +384,7 @@ class TaskPlanner:
                      "date", "time", "startAt", "endAt"]), state="locking_seats")
             if slots.get("showtimeId"):
                 return AgentPlan(action="get_seats",
-                    params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference"]),
+                    params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference", "seatType"]),
                     state="selecting_seats")
             return AgentPlan(action="confirm_selection", params=slots, state="confirming")
 
@@ -396,6 +399,7 @@ class TaskPlanner:
                         "showtimeId",
                         "ticketCount",
                         "seatPreference",
+                        "seatType",
                         "seatPositions",
                         "autoSelectSeats",
                     ],
@@ -476,7 +480,7 @@ class TaskPlanner:
                     params=self._pick(slots, ["movieId", "movieName", "genre", "date",
                         "timeRange", "ticketCount", "cinemaId", "cinemaName",
                         "hallType", "pricePreference", "timePreference",
-                        "seatPreference", "seatPositions", "autoSelectShowtime",
+                        "seatPreference", "seatType", "seatPositions", "autoSelectShowtime",
                         "autoSelectSeats", "skipSnacks"]),
                     state="selecting_showtime")
             return AgentPlan(action="get_seats",
@@ -486,8 +490,10 @@ class TaskPlanner:
                         "showtimeId",
                         "ticketCount",
                         "seatPreference",
+                        "seatType",
                         "seatPositions",
                         "autoSelectSeats",
+                        "skipSnacks",
                     ],
                 ),
                 state="selecting_seats")
@@ -520,6 +526,9 @@ class TaskPlanner:
                         "maxPrice",
                         "pricePreference",
                         "timePreference",
+                        "seatPreference",
+                        "seatType",
+                        "seatPositions",
                         "autoSelectShowtime",
                         "autoSelectSeats",
                         "skipSnacks",
@@ -544,7 +553,7 @@ class TaskPlanner:
             and state.state == "selecting_seats"
         ):
             return AgentPlan(action="get_seats",
-                params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference", "seatPositions"]),
+                params=self._pick(slots, ["showtimeId", "ticketCount", "seatPreference", "seatType", "seatPositions"]),
                 state="selecting_seats")
 
         return AgentPlan(action="general_answer",
@@ -557,7 +566,27 @@ class TaskPlanner:
     def _plan_booking(self, state: AgentState, nlu: NLUResult,
                       slots: dict[str, Any]) -> AgentPlan:
         tr = tracker.assess(state, nlu)
-
+        if (
+            tr.flow == "book_ticket"
+            and slots.get("genre")
+            and slots.get("movieName") in [None, ""]
+            and slots.get("movieId") in [None, ""]
+            and not slots.get("autoSelectShowtime")
+            and (
+                not tr.next_ask
+                or "cinemaName" in tr.missing
+            )
+        ):
+            return AgentPlan(
+                action="search_movies",
+                reason="用户给出类型但未指定影片，先搜片让用户选择",
+                params=self._pick(slots, ["genre", "date", "timeRange",
+                    "ticketCount", "cinemaId", "cinemaName", "hallType",
+                    "maxPrice", "recommendationCriteria", "seatPreference",
+                    "seatType", "seatPositions", "autoSelectSeats",
+                    "skipSnacks"]),
+                state="selecting_movie",
+            )
         # Movie validation gate: before asking for anything, verify the
         # movie actually has showtimes. LLM chat may have mentioned films
         # that aren't in our database.
@@ -570,6 +599,7 @@ class TaskPlanner:
                     [
                         "ticketCount",
                         "seatPreference",
+                        "seatType",
                         "autoSelectSeats",
                         "skipSnacks",
                     ],
@@ -624,6 +654,7 @@ class TaskPlanner:
                         "timePreference",
                         "location",
                         "nearbyFirst",
+                        "seatType",
                         "autoSelectShowtime",
                         "autoSelectSeats",
                         "skipSnacks",
@@ -638,36 +669,53 @@ class TaskPlanner:
                     state="selecting_showtime",
                 )
 
+        if tr.next_ask:
+            return AgentPlan(
+                action="ask",
+                reason=f"缺少 {tr.next_ask}",
+                params={"missing": tr.missing, "filled": tr.filled,
+                        "next_ask": tr.next_ask, "flow": tr.flow},
+                state=tr.stage,
+            )
+
         if (
             tr.flow == "book_ticket"
             and movie_name
             and not slots.get("movieId")
             and not self._movie_is_verified(movie_name, state)
         ):
-            if slots.get("seatPositions"):
+            if slots.get("seatPositions") or self._has_complete_booking_slots(slots):
+                params = self._pick(
+                    slots,
+                    [
+                        "movieName",
+                        "movieId",
+                        "date",
+                        "timeRange",
+                        "ticketCount",
+                        "cinemaId",
+                        "cinemaName",
+                        "hallType",
+                        "notHallType",
+                        "maxPrice",
+                        "seatPreference",
+                        "seatType",
+                        "seatPositions",
+                        "excludeShowtimeId",
+                        "autoSelectShowtime",
+                        "autoSelectSeats",
+                        "skipSnacks",
+                    ],
+                )
+                if self._has_complete_booking_slots(slots):
+                    params.setdefault("autoSelectShowtime", True)
+                    params.setdefault("autoSelectSeats", True)
+                    params.setdefault("seatPreference", slots.get("seatPreference") or "middle")
+                    params.setdefault("skipSnacks", True)
                 return AgentPlan(
                     action="search_showtimes",
-                    reason="用户已给出具体座位，直接查场次并尝试锁座",
-                    params=self._pick(
-                        slots,
-                        [
-                            "movieName",
-                            "movieId",
-                            "date",
-                            "timeRange",
-                            "ticketCount",
-                            "cinemaId",
-                            "cinemaName",
-                            "hallType",
-                            "notHallType",
-                            "maxPrice",
-                            "seatPositions",
-                            "excludeShowtimeId",
-                            "autoSelectShowtime",
-                            "autoSelectSeats",
-                            "skipSnacks",
-                        ],
-                    ),
+                    reason="购票槽位齐全，直接查场次并尝试出订单",
+                    params=params,
                     state="selecting_showtime",
                 )
             return AgentPlan(
@@ -697,30 +745,17 @@ class TaskPlanner:
                 return AgentPlan(
                     action="search_showtimes",
                     reason="购票信息齐全，查场次",
-                    params=self._pick(slots, ["movieName", "movieId", "date", "timeRange",
-                        "ticketCount", "cinemaId", "cinemaName", "hallType",
-                        "notHallType", "maxPrice", "seatPositions",
-                        "snackRequests", "autoSelectShowtime", "autoSelectSeats",
-                        "skipSnacks"]),
+                    params=self._ready_booking_params(slots),
                     state="selecting_showtime",
                 )
             return AgentPlan(
                 action="search_movies",
                 reason="先搜电影让用户选",
                 params=self._pick(slots, ["movieName", "genre", "date", "timeRange",
-                    "ticketCount",
-                    "cinemaId", "cinemaName", "hallType", "recommendationCriteria",
-                    "autoSelectShowtime", "autoSelectSeats", "skipSnacks"]),
+                        "ticketCount", "cinemaId", "cinemaName", "hallType",
+                        "maxPrice", "recommendationCriteria",
+                        "skipSnacks"]),
                 state="selecting_movie",
-            )
-
-        if tr.next_ask:
-            return AgentPlan(
-                action="ask",
-                reason=f"缺少 {tr.next_ask}",
-                params={"missing": tr.missing, "filled": tr.filled,
-                        "next_ask": tr.next_ask, "flow": tr.flow},
-                state=tr.stage,
             )
 
         return AgentPlan(
@@ -796,6 +831,45 @@ class TaskPlanner:
                 ):
                     return True
         return False
+
+    def _ready_booking_params(self, slots: dict[str, Any]) -> dict[str, Any]:
+        params = self._pick(slots, ["movieName", "movieId", "date", "timeRange",
+            "ticketCount", "cinemaId", "cinemaName", "hallType",
+            "notHallType", "maxPrice", "seatPreference", "seatType",
+            "seatPositions", "snackRequests", "autoSelectShowtime",
+            "autoSelectSeats", "skipSnacks"])
+        if self._has_complete_booking_slots(slots):
+            params.setdefault("autoSelectShowtime", True)
+            params.setdefault("autoSelectSeats", True)
+            params.setdefault("seatPreference", slots.get("seatPreference") or "middle")
+            params.setdefault("skipSnacks", True)
+        return params
+
+    @staticmethod
+    def _has_complete_booking_slots(slots: dict[str, Any]) -> bool:
+        has_movie = slots.get("movieName") not in [None, ""] or slots.get("movieId") not in [None, ""]
+        has_cinema = (
+            slots.get("cinemaName") not in [None, ""]
+            or slots.get("cinemaId") not in [None, ""]
+            or (
+                slots.get("nearbyFirst")
+                and slots.get("location") not in [None, ""]
+            )
+        )
+        has_seat = any(
+            slots.get(key) not in [None, "", [], {}]
+            for key in ["seatPreference", "seatType", "seatPositions", "seatIds", "autoSelectSeats"]
+        )
+        return all(
+            [
+                has_movie,
+                slots.get("ticketCount") not in [None, ""],
+                slots.get("date") not in [None, ""],
+                slots.get("timeRange") not in [None, ""],
+                has_cinema,
+                has_seat,
+            ]
+        )
 
     @staticmethod
     def _pick(source: dict[str, Any], keys: list[str]) -> dict[str, Any]:

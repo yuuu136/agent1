@@ -1,11 +1,12 @@
 from copy import deepcopy
 from typing import Any
 
+from app.agent.genres import CANONICAL_GENRES, GENRE_TERMS
 from app.schemas.agent import AgentState
 from app.utils.config_handler import agent_config
 
 
-GENRE_VALUES = {"喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}
+GENRE_VALUES = set(CANONICAL_GENRES) | set(GENRE_TERMS)
 HALL_TYPE_VALUES = {"IMAX", "杜比", "巨幕", "激光"}
 INVALID_MOVIE_NAME_VALUES = {"影院", "选择影院", "择影院", "电影", "选择电影", "择电影"}
 INVALID_MOVIE_NAME_VALUES.update(

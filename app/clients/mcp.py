@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from app.agent.genres import genre_match_terms
 from app.schemas.agent import ToolResult
 from app.utils.config_handler import agent_config
 
@@ -171,6 +172,34 @@ class SpringBootMovieTicketMCP:
             genre=arguments.get("genre"),
         )
         movies = self._filter_movies(all_movies, keyword, genre, actor)
+        if not movies and genre:
+            broad_movies = self._load_movie_cards(
+                {
+                    **arguments,
+                    "size": max(int(arguments.get("size") or 10), 50),
+                },
+                keyword=keyword,
+                genre=None,
+            )
+            movies = self._filter_movies(broad_movies, keyword, genre, actor)
+            if movies:
+                all_movies = broad_movies
+        if arguments.get("resolveMovieOnly"):
+            return ToolResult(
+                tool_name="spring_boot.search_movies",
+                data={
+                    "movies": movies,
+                    "source": "spring_boot_database",
+                },
+                message=self._movie_search_message(
+                    movies,
+                    recommendation_criteria,
+                    genre=arguments.get("genre"),
+                    keyword=keyword or actor,
+                    date=arguments.get("date"),
+                ),
+                suggestions=self._browse_suggestions(movies, arguments),
+            )
         if (
             recommendation_criteria
             and not self._has_showtime_constraints(arguments)
@@ -357,6 +386,7 @@ class SpringBootMovieTicketMCP:
                 arguments.get("pricePreference"),
                 arguments.get("timePreference"),
                 arguments.get("excludeShowtimeId"),
+                max_price=arguments.get("maxPrice"),
             )
         showtimes = self._filter_showtimes_by_hall_type(
             showtimes,
@@ -428,6 +458,7 @@ class SpringBootMovieTicketMCP:
             arguments.get("pricePreference"),
             arguments.get("timePreference"),
             arguments.get("excludeShowtimeId"),
+            max_price=arguments.get("maxPrice"),
         )
 
     def _load_showtimes_without_movie_id(
@@ -557,6 +588,7 @@ class SpringBootMovieTicketMCP:
             arguments.get("pricePreference"),
             arguments.get("timePreference"),
             arguments.get("excludeShowtimeId"),
+            max_price=arguments.get("maxPrice"),
         )
 
     def _load_showtimes_for_cinema_date_window(
@@ -622,6 +654,40 @@ class SpringBootMovieTicketMCP:
                         "status": self._normalize_seat_status(
                             self._first_present(seat, "status", "seatStatus")
                         ),
+                        "seatType": self._first_present(seat, "seatType", "type", "kind"),
+                        "zone": self._first_present(
+                            seat,
+                            "zone",
+                            "seatZone",
+                            "area",
+                            "seatArea",
+                            "region",
+                            "section",
+                        ),
+                        "isBestViewing": self._first_present(
+                            seat,
+                            "isBestViewing",
+                            "bestViewing",
+                            "bestView",
+                            "best",
+                            "isBest",
+                        ),
+                        "coupleGroupId": self._first_present(
+                            seat,
+                            "coupleGroupId",
+                            "coupleSeatGroupId",
+                            "seatPairId",
+                            "pairId",
+                            "coupleId",
+                            "groupId",
+                        ),
+                        "pairSeatId": self._first_present(
+                            seat,
+                            "pairSeatId",
+                            "linkedSeatId",
+                            "buddySeatId",
+                            "mateSeatId",
+                        ),
                         "price": self._cents_to_yuan(
                             self._first_present(seat, "price", "unitPrice")
                             or data.get("basePrice")
@@ -649,10 +715,15 @@ class SpringBootMovieTicketMCP:
         if isinstance(value, int):
             return numeric_statuses.get(value, "unavailable")
         text = str(value or "AVAILABLE").strip().lower()
+        if "couple" in text:
+            return "couple"
         return {
             "available": "available",
+            "free": "available",
             "locked": "locked",
+            "lock": "locked",
             "sold": "sold",
+            "occupied": "sold",
             "unavailable": "unavailable",
             "couple": "couple",
         }.get(text, "unavailable")
@@ -1368,6 +1439,7 @@ class SpringBootMovieTicketMCP:
                 "date",
                 "timeRange",
                 "ticketCount",
+                "maxPrice",
                 "hallType",
                 "recommendationCriteria",
             ]
@@ -1648,7 +1720,7 @@ class SpringBootMovieTicketMCP:
     def _has_showtime_constraints(arguments: dict[str, Any]) -> bool:
         return any(
             arguments.get(key)
-            for key in ["date", "timeRange", "ticketCount", "hallType"]
+            for key in ["date", "timeRange", "ticketCount", "hallType", "maxPrice"]
         )
 
     @staticmethod
@@ -1849,7 +1921,8 @@ class SpringBootMovieTicketMCP:
         date_value = self._spring_date(arguments.get("date"))
         time_range = arguments.get("timeRange")
         ticket_count = arguments.get("ticketCount")
-        if not date_value and not time_range and not ticket_count:
+        max_price = arguments.get("maxPrice")
+        if not date_value and not time_range and not ticket_count and not max_price:
             return movies
 
         filtered_movies: list[dict[str, Any]] = []
@@ -1863,6 +1936,7 @@ class SpringBootMovieTicketMCP:
                 date_value,
                 time_range,
                 ticket_count,
+                max_price,
             )
             if not matching:
                 continue
@@ -1894,6 +1968,7 @@ class SpringBootMovieTicketMCP:
         date_value: str | None,
         time_range: Any,
         ticket_count: Any,
+        max_price: Any = None,
     ) -> list[dict[str, Any]]:
         min_seats = int(ticket_count or 0)
         requested_time = str(time_range or "")
@@ -1908,6 +1983,8 @@ class SpringBootMovieTicketMCP:
                 continue
             remaining = showtime.get("remainingSeats")
             if min_seats and remaining is not None and int(remaining) < min_seats:
+                continue
+            if not self._price_within_limit(showtime.get("price"), max_price):
                 continue
             showtime_time = showtime.get("time") or str(showtime.get("startAt") or "")[11:16]
             if requested_time and not self._time_matches(showtime_time, requested_time):
@@ -1932,12 +2009,23 @@ class SpringBootMovieTicketMCP:
             movie_cast = str(movie.get("cast") or "").casefold()
             if normalized_keyword and normalized_keyword not in movie_name:
                 continue
-            if normalized_genre and normalized_genre not in movie_genre:
+            if normalized_genre and not self._movie_matches_genre(movie_genre, normalized_genre):
                 continue
             if normalized_actor and normalized_actor not in movie_cast:
                 continue
             filtered.append(movie)
         return filtered
+
+    @classmethod
+    def _movie_matches_genre(cls, movie_genre: str, requested_genre: str) -> bool:
+        requested_terms = cls._genre_match_terms(requested_genre)
+        if not requested_terms:
+            return requested_genre in movie_genre
+        return any(term.casefold() in movie_genre for term in requested_terms)
+
+    @staticmethod
+    def _genre_match_terms(genre: Any) -> tuple[str, ...]:
+        return genre_match_terms(genre)
 
     def _rank_recommended_movies(
         self,
@@ -2336,6 +2424,7 @@ class SpringBootMovieTicketMCP:
         price_preference: Any = None,
         time_preference: Any = None,
         exclude_showtime_id: Any = None,
+        max_price: Any = None,
     ) -> list[dict[str, Any]]:
         requested_time = str(time_range or "")
         min_seats = int(ticket_count or 0)
@@ -2354,6 +2443,8 @@ class SpringBootMovieTicketMCP:
                 continue
             remaining = showtime.get("remainingSeats")
             if min_seats and remaining is not None and int(remaining) < min_seats:
+                continue
+            if not self._price_within_limit(showtime.get("price"), max_price):
                 continue
             if requested_time and not self._time_matches(showtime.get("time"), requested_time):
                 continue
@@ -2396,6 +2487,17 @@ class SpringBootMovieTicketMCP:
                 if earlier:
                     filtered = earlier
         return filtered
+
+    @staticmethod
+    def _price_within_limit(price: Any, max_price: Any) -> bool:
+        if max_price in [None, ""]:
+            return True
+        if price in [None, ""]:
+            return True
+        try:
+            return float(price) <= float(max_price)
+        except (TypeError, ValueError):
+            return True
 
     @staticmethod
     def _filter_showtimes_by_hall_type(
@@ -2547,6 +2649,8 @@ class SpringBootMovieTicketMCP:
             parts.append(self._display_time_range(arguments["timeRange"]))
         if arguments.get("ticketCount"):
             parts.append(f"{arguments['ticketCount']}张票")
+        if arguments.get("maxPrice"):
+            parts.append(f"单张{arguments['maxPrice']}元以内")
         if arguments.get("hallType"):
             parts.append(str(arguments["hallType"]))
         return "、".join(parts)
