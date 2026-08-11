@@ -520,7 +520,7 @@ class AgentService:
             movies = data.get("movies") or []
             if isinstance(movies, list) and movies:
                 want_specific = plan.params.get("movieName") or plan.params.get("keyword")
-                if (want_specific or plan.params.get("movieLimit") == 1) and len(movies) == 1:
+                if want_specific and len(movies) == 1:
                     movie = movies[0]
                     showtimes = movie.get("upcomingShowtimes") or []
                     if showtimes:
@@ -820,6 +820,7 @@ class AgentService:
             return
 
         seats = seat_result.data.get("seats") or []
+        seat_type = plan.params.get("seatType") or state.slots.get("seatType")
         selected_ids: list[Any] = []
         missing: list[str] = []
         unavailable: list[str] = []
@@ -842,12 +843,7 @@ class AgentService:
             if not match or match.get("seatId") in [None, ""]:
                 missing.append(label)
                 continue
-            if str(match.get("status") or "").lower() in {
-                "locked",
-                "sold",
-                "unavailable",
-                "couple",
-            }:
+            if not self._is_selectable_seat(match, seat_type):
                 unavailable.append(label)
                 continue
             selected_ids.append(match["seatId"])
@@ -860,6 +856,7 @@ class AgentService:
                 seats,
                 positions,
                 prefix=f"座位图中没有找到：{'、'.join(missing)}。",
+                seat_type=seat_type,
             )
             state.state = "selecting_seats"
             state.pending_action = "get_seats"
@@ -872,6 +869,7 @@ class AgentService:
                 seats,
                 positions,
                 prefix=f"指定座位已被占用：{'、'.join(unavailable)}。",
+                seat_type=seat_type,
             )
             state.state = "selecting_seats"
             state.pending_action = "get_seats"
@@ -953,6 +951,7 @@ class AgentService:
     ) -> None:
         """Choose sensible seats from the current seat map for a natural-language request."""
         seats = result.data.get("seats") or []
+        seat_type = plan.params.get("seatType") or state.slots.get("seatType")
         preference = str(
             plan.params.get("seatPreference")
             or state.slots.get("seatPreference")
@@ -961,7 +960,7 @@ class AgentService:
         available_count = sum(
             1
             for seat in seats
-            if isinstance(seat, dict) and self._is_selectable_seat(seat)
+            if isinstance(seat, dict) and self._is_selectable_seat(seat, seat_type)
         )
         ticket_count = (
             available_count
@@ -977,10 +976,12 @@ class AgentService:
             seats,
             ticket_count,
             preference,
+            seat_type,
         )
         if not positions:
+            seat_label = "情侣座" if str(seat_type or "").lower() == "couple" else "座位"
             result.message = (
-                f"当前只有{available_count}个可用座位，无法满足{ticket_count}张票。"
+                f"当前只有{available_count}个可用{seat_label}，无法满足{ticket_count}张票。"
                 "请减少票数或换一场。"
             )
             result.suggestions = ["换一场", "重新选座"]
@@ -990,6 +991,8 @@ class AgentService:
 
         state.slots["seatPositions"] = positions
         state.slots["ticketCount"] = ticket_count
+        if seat_type:
+            state.slots["seatType"] = seat_type
         state.slots.pop("autoSelectSeats", None)
         result.data["autoSelectedSeats"] = positions
 
@@ -998,18 +1001,28 @@ class AgentService:
         seats: list[Any],
         ticket_count: int,
         preference: str = "middle",
+        seat_type: Any = None,
     ) -> list[dict[str, int]]:
         if ticket_count <= 0:
             return []
+        if str(seat_type or "").lower() == "couple":
+            return self._choose_couple_seat_positions(
+                seats,
+                ticket_count,
+                preference,
+            )
 
         available: list[tuple[int, int]] = []
+        best_available: list[tuple[int, int]] = []
         for seat in seats:
-            if not isinstance(seat, dict) or not self._is_selectable_seat(seat):
+            if not isinstance(seat, dict) or not self._is_selectable_seat(seat, seat_type):
                 continue
             row_no = self._seat_row(seat)
             seat_no = self._seat_number(seat)
             if row_no is not None and seat_no is not None:
                 available.append((row_no, seat_no))
+                if self._is_best_viewing_seat(seat):
+                    best_available.append((row_no, seat_no))
         available = sorted(set(available))
         if len(available) < ticket_count:
             return []
@@ -1018,6 +1031,30 @@ class AgentService:
                 {"rowNo": row_no, "seatNo": seat_no}
                 for row_no, seat_no in available
             ]
+        if preference in {"best", "middle"}:
+            best_available = sorted(set(best_available))
+            best_positions = self._choose_auto_seat_positions_from_available(
+                best_available,
+                ticket_count,
+                preference,
+            )
+            if best_positions:
+                return best_positions
+
+        return self._choose_auto_seat_positions_from_available(
+            available,
+            ticket_count,
+            preference,
+        )
+
+    def _choose_auto_seat_positions_from_available(
+        self,
+        available: list[tuple[int, int]],
+        ticket_count: int,
+        preference: str,
+    ) -> list[dict[str, int]]:
+        if len(available) < ticket_count:
+            return []
 
         rows = sorted({row_no for row_no, _ in available})
         numbers = [seat_no for _, seat_no in available]
@@ -1090,6 +1127,177 @@ class AgentService:
             {"rowNo": row_no, "seatNo": seat_no}
             for row_no, seat_no in chosen
         ]
+
+    @staticmethod
+    def _is_best_viewing_seat(seat: dict[str, Any]) -> bool:
+        flag = seat.get("isBestViewing")
+        if isinstance(flag, bool):
+            return flag
+        if str(flag or "").strip().lower() in {"1", "true", "yes", "y"}:
+            return True
+        zone = str(
+            seat.get("zone")
+            or seat.get("seatZone")
+            or seat.get("area")
+            or seat.get("region")
+            or seat.get("section")
+            or ""
+        )
+        normalized = re.sub(r"[\s，。,.!?！？、:：;；_-]+", "", zone).casefold()
+        return any(
+            word in normalized
+            for word in ["最佳观影", "最佳区", "黄金区", "黄金位置", "bestview", "best", "prime"]
+        )
+
+    def _choose_couple_seat_positions(
+        self,
+        seats: list[Any],
+        ticket_count: int,
+        preference: str = "middle",
+    ) -> list[dict[str, int]]:
+        if ticket_count <= 0 or ticket_count % 2 != 0:
+            return []
+
+        pairs = self._couple_seat_pairs(seats)
+        pair_count = ticket_count // 2
+        if len(pairs) < pair_count:
+            return []
+
+        all_positions = [position for pair in pairs for position in pair]
+        rows = [row_no for row_no, _ in all_positions]
+        numbers = [seat_no for _, seat_no in all_positions]
+        min_row, max_row = min(rows), max(rows)
+        min_number, max_number = min(numbers), max(numbers)
+        if preference == "front":
+            target_row = float(min_row)
+        elif preference == "back":
+            target_row = float(max_row)
+        else:
+            target_row = (min_row + max_row) / 2
+        target_number = (min_number + max_number) / 2
+
+        def score(pair: list[tuple[int, int]]) -> tuple[float, float, int, int]:
+            pair_rows = [row_no for row_no, _ in pair]
+            pair_numbers = [seat_no for _, seat_no in pair]
+            row_center = sum(pair_rows) / len(pair_rows)
+            number_center = sum(pair_numbers) / len(pair_numbers)
+            return (
+                abs(row_center - target_row),
+                abs(number_center - target_number),
+                min(pair_rows),
+                min(pair_numbers),
+            )
+
+        if preference == "random":
+            chosen_pairs = secrets.SystemRandom().sample(pairs, pair_count)
+        else:
+            chosen_pairs = sorted(pairs, key=score)[:pair_count]
+
+        chosen = sorted(position for pair in chosen_pairs for position in pair)
+        return [
+            {"rowNo": row_no, "seatNo": seat_no}
+            for row_no, seat_no in chosen
+        ]
+
+    def _couple_seat_pairs(self, seats: list[Any]) -> list[list[tuple[int, int]]]:
+        couple_seats: list[dict[str, Any]] = [
+            seat
+            for seat in seats
+            if isinstance(seat, dict) and self._is_selectable_seat(seat, "couple")
+        ]
+        positions_by_id: dict[str, tuple[int, int]] = {}
+        seats_by_id: dict[str, dict[str, Any]] = {}
+        for seat in couple_seats:
+            seat_id = seat.get("seatId")
+            row_no = self._seat_row(seat)
+            seat_no = self._seat_number(seat)
+            if seat_id not in [None, ""] and row_no is not None and seat_no is not None:
+                seats_by_id[str(seat_id)] = seat
+                positions_by_id[str(seat_id)] = (row_no, seat_no)
+
+        pairs: list[list[tuple[int, int]]] = []
+        used: set[tuple[int, int]] = set()
+        for seat_id, seat in seats_by_id.items():
+            position = positions_by_id.get(seat_id)
+            pair_seat_id = self._seat_pair_seat_id(seat)
+            pair_position = positions_by_id.get(pair_seat_id)
+            if not position or not pair_position:
+                continue
+            pair = sorted([position, pair_position])
+            if pair[0] == pair[1] or any(item in used for item in pair):
+                continue
+            pairs.append(pair)
+            used.update(pair)
+
+        pair_groups: dict[str, list[tuple[int, int]]] = {}
+        for seat in couple_seats:
+            group_id = self._seat_couple_group_id(seat)
+            row_no = self._seat_row(seat)
+            seat_no = self._seat_number(seat)
+            if (
+                not group_id
+                or row_no is None
+                or seat_no is None
+                or (row_no, seat_no) in used
+            ):
+                continue
+            pair_groups.setdefault(group_id, []).append((row_no, seat_no))
+
+        for positions in pair_groups.values():
+            unique = sorted(set(positions))
+            if len(unique) < 2:
+                continue
+            for index in range(0, len(unique) - 1, 2):
+                pair = unique[index:index + 2]
+                if len(pair) == 2:
+                    pairs.append(pair)
+                    used.update(pair)
+
+        by_row: dict[int, list[int]] = {}
+        for seat in couple_seats:
+            row_no = self._seat_row(seat)
+            seat_no = self._seat_number(seat)
+            if row_no is None or seat_no is None or (row_no, seat_no) in used:
+                continue
+            by_row.setdefault(row_no, []).append(seat_no)
+
+        for row_no, row_numbers in by_row.items():
+            unique_numbers = sorted(set(row_numbers))
+            for index in range(0, len(unique_numbers) - 1, 2):
+                left = unique_numbers[index]
+                right = unique_numbers[index + 1]
+                if left + 1 == right:
+                    pairs.append([(row_no, left), (row_no, right)])
+
+        return pairs
+
+    @staticmethod
+    def _seat_couple_group_id(seat: dict[str, Any]) -> str:
+        for key in [
+            "coupleGroupId",
+            "coupleSeatGroupId",
+            "seatPairId",
+            "pairId",
+            "coupleId",
+            "groupId",
+        ]:
+            value = seat.get(key)
+            if value not in [None, ""]:
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _seat_pair_seat_id(seat: dict[str, Any]) -> str:
+        for key in [
+            "pairSeatId",
+            "linkedSeatId",
+            "buddySeatId",
+            "mateSeatId",
+        ]:
+            value = seat.get(key)
+            if value not in [None, ""]:
+                return str(value)
+        return ""
 
     def _auto_select_showtime(
         self,
@@ -1183,11 +1391,24 @@ class AgentService:
     def _seat_number(self, seat: dict[str, Any]) -> int | None:
         return self._as_int(seat.get("number") or seat.get("seatNo"))
 
-    def _is_selectable_seat(self, seat: dict[str, Any]) -> bool:
+    def _is_selectable_seat(self, seat: dict[str, Any], seat_type: Any = None) -> bool:
         if seat.get("seatId") in [None, ""]:
             return False
         status = str(seat.get("status") or "available").lower()
-        return status not in {"locked", "sold", "unavailable", "couple"}
+        if status in {"locked", "sold", "unavailable"}:
+            return False
+        requested_type = str(seat_type or "").lower()
+        if requested_type == "couple":
+            actual_type = str(
+                seat.get("seatType")
+                or seat.get("type")
+                or seat.get("kind")
+                or ""
+            ).lower()
+            return status == "couple" or actual_type == "couple"
+        if status == "couple":
+            return False
+        return True
 
     def _set_seat_retry_message(
         self,
@@ -1195,8 +1416,9 @@ class AgentService:
         seats: list[Any],
         positions: list[Any],
         prefix: str,
+        seat_type: Any = None,
     ) -> None:
-        suggestions = self._suggest_available_seats(seats, positions)
+        suggestions = self._suggest_available_seats(seats, positions, seat_type=seat_type)
         if suggestions:
             result.message = f"{prefix} 可选：{'、'.join(suggestions)}。"
             result.suggestions = suggestions
@@ -1209,6 +1431,7 @@ class AgentService:
         seats: list[Any],
         positions: list[Any],
         limit: int = 4,
+        seat_type: Any = None,
     ) -> list[str]:
         requested = [
             (self._as_int(position.get("rowNo")), self._as_int(position.get("seatNo")))
@@ -1222,7 +1445,7 @@ class AgentService:
         ]
         available: list[tuple[int, int]] = []
         for seat in seats:
-            if not isinstance(seat, dict) or not self._is_selectable_seat(seat):
+            if not isinstance(seat, dict) or not self._is_selectable_seat(seat, seat_type):
                 continue
             row_no = self._seat_row(seat)
             seat_no = self._seat_number(seat)

@@ -159,6 +159,7 @@ def _build_ask_message(state: "AgentState", plan: "AgentPlan") -> str:
             "想看什么时间段的？上午、下午还是晚上？"
         ),
         "cinemaName": lambda: "有想去的影院吗？或者我帮你查查附近有哪些～",
+        "seatPreference": lambda: "想坐什么位置？中间、前排、后排，或者普通座都可以～",
         "showtimeId": lambda: "我帮你查了场次，选一个合适的吧～",
         "seatIds": lambda: "座位图准备好了，选几个座位吧～",
     }

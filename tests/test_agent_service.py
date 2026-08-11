@@ -31,7 +31,7 @@ class MockSpringNearbyResponse:
         }
 
 
-def test_chat_booking_text_requires_login_for_real_ticketing() -> None:
+def test_chat_booking_text_asks_missing_cinema_before_real_ticketing() -> None:
     client = TestClient(app)
 
     response = client.post(
@@ -55,7 +55,9 @@ def test_chat_booking_text_requires_login_for_real_ticketing() -> None:
     # DST-based planner may route to collecting_* or selecting_* depending on NLU output
     assert "collecting" in payload["state"] or "selecting" in payload["state"]
     assert payload["cards"] == []
-    assert payload["message"] == "请先登录后再使用真实票务服务。"
+    assert payload["message"] == "有想去的影院吗？或者我帮你查查附近有哪些～"
+    assert payload["session"]["pendingAction"] == "ask"
+    assert payload["session"]["slots"]["ticketCount"] == 2
 
 
 def test_chat_empty_new_session_returns_greeting() -> None:
@@ -266,7 +268,7 @@ def test_stream_chat_returns_sse_events() -> None:
     assert '"node": "planner"' in response.text
 
 
-def test_full_movie_ticket_flow_without_login_stops_before_database() -> None:
+def test_full_movie_ticket_flow_without_login_asks_missing_cinema_first() -> None:
     client = TestClient(app)
     session_id = "agent-full-flow"
 
@@ -286,4 +288,5 @@ def test_full_movie_ticket_flow_without_login_stops_before_database() -> None:
         },
     ).json()
     assert showtime_response["cards"] == []
-    assert showtime_response["message"] == "请先登录后再使用真实票务服务。"
+    assert showtime_response["message"] == "有想去的影院吗？或者我帮你查查附近有哪些～"
+    assert showtime_response["session"]["pendingAction"] == "ask"

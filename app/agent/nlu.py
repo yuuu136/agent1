@@ -11,6 +11,11 @@ from zoneinfo import ZoneInfo
 
 from openai import OpenAI
 
+from app.agent.genres import (
+    GENRE_TERMS_PATTERN,
+    canonical_genre_from_text,
+    is_genre_phrase,
+)
 from app.agent.intent_rag import IntentMatch, IntentRAGUnavailable, get_intent_rag_retriever
 from app.prompts import prompt_manager
 from app.schemas.agent import AgentState, ChatRequest, NLUResult
@@ -327,6 +332,8 @@ def _auto_seat_preference(text: str) -> str:
         return "front"
     if any(word in normalized for word in ["后排", "靠后", "后面"]):
         return "back"
+    if any(word in normalized for word in ["最佳观影区", "黄金观影区", "最佳观影", "黄金位置", "好位置"]):
+        return "best"
     return "middle"
 
 
@@ -338,9 +345,26 @@ def is_text_auto_seat_or_auto_purchase(text: str) -> bool:
     return is_auto_seat_request(text)
 
 
+def is_direct_current_showtime_confirmation(text: str) -> bool:
+    normalized = _normalize_short_text(text)
+    return normalized in {
+        "确认",
+        "确认这场",
+        "确认当前选择",
+        "就这场",
+        "选这场",
+        "帮我直接买",
+        "帮我直接买了",
+        "直接买",
+        "直接买了",
+        "买这场",
+        "订这场",
+    }
+
+
 def is_auto_seat_request(text: str) -> bool:
     normalized = _normalize_short_text(text)
-    if not any(word in normalized for word in ["座位", "选座", "位置", "座"]):
+    if not any(word in normalized for word in ["座位", "选座", "位置", "座", "观影区", "观影"]):
         return False
     return any(
         phrase in normalized
@@ -354,6 +378,11 @@ def is_auto_seat_request(text: str) -> bool:
             "选个好位置",
             "选个位置",
             "选好位置",
+            "最佳观影区",
+            "黄金观影区",
+            "最佳观影",
+            "黄金位置",
+            "好位置",
             "中间位置",
             "中间的",
             "靠中间",
@@ -481,16 +510,68 @@ class LLMNLU:
                     slots=slots,
                     reference_text=text,
                 )
+            if (
+                state
+                and is_direct_current_showtime_confirmation(text)
+                and _showtime_candidate_context(state)
+                and not state.slots.get("orderId")
+            ):
+                slots = _showtime_candidate_context(state)
+                if any(word in _normalize_short_text(text) for word in ["买", "订", "直接"]):
+                    slots["autoSelectSeats"] = True
+                    slots["seatPreference"] = state.slots.get("seatPreference", "middle")
+                    if state.slots.get("seatType") not in [None, ""]:
+                        slots["seatType"] = state.slots["seatType"]
+                    slots["skipSnacks"] = True
+                return NLUResult(
+                    intent="select_showtime",
+                    confidence=0.99,
+                    intent_source="rule",
+                    slots=slots,
+                    reference_text=text,
+                )
             recommendation_slots = self._extract_recommendation_slots(text)
             if (
                 recommendation_slots
-                and self._extract_recommendation_movie_limit(text) is not None
+                and (
+                    self._extract_recommendation_movie_limit(text) is not None
+                    or recommendation_slots.get("genre") not in [None, ""]
+                )
             ):
                 return NLUResult(
                     intent="search_movies",
                     confidence=0.98,
                     intent_source="rule",
                     slots=recommendation_slots,
+                    reference_text=text,
+                )
+            if self._is_deterministic_booking_text(text):
+                slots = self._extract_booking_slots(text, payload)
+                movie_names = self._extract_multi_movie_names(text)
+                if len(movie_names) > 1:
+                    slots["movieNames"] = movie_names
+                    slots.pop("movieName", None)
+                    return NLUResult(
+                        intent="multi_movie_booking",
+                        confidence=0.96,
+                        intent_source="rule",
+                        slots=slots,
+                        reference_text=text,
+                    )
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.96,
+                    intent_source="rule",
+                    slots=slots,
+                    reference_text=text,
+                )
+            no_showtime_followup_slots = self._no_showtime_followup_slots(text, state)
+            if no_showtime_followup_slots is not None:
+                return NLUResult(
+                    intent="search_showtimes",
+                    confidence=0.99,
+                    intent_source="rule",
+                    slots=no_showtime_followup_slots,
                     reference_text=text,
                 )
             hall_type_showtime_slots = self._extract_hall_type_showtime_slots(text)
@@ -546,6 +627,15 @@ class LLMNLU:
                     slots=self._other_cinema_showtime_slots(state),
                     reference_text=text,
                 )
+            seat_action_slots = self._extract_seat_action_slots(text, state)
+            if seat_action_slots is not None:
+                return NLUResult(
+                    intent="seat_query",
+                    confidence=0.98,
+                    intent_source="rule",
+                    slots=seat_action_slots,
+                    reference_text=text,
+                )
             if (
                 state
                 and state.state == "selecting_seats"
@@ -583,6 +673,9 @@ class LLMNLU:
                     intent_source="llm",
                     reference_text=text,
                 )
+            contextual_ack = self._try_contextual_ack(text, state)
+            if contextual_ack is not None:
+                return contextual_ack
             hybrid_rule = self._hybrid_rule_candidate(text, payload, state)
             if hybrid_rule is not None:
                 return self._resolve_hybrid_intent(
@@ -635,6 +728,7 @@ class LLMNLU:
                     intent="seat_query",
                     confidence=0.95,
                     intent_source="rule",
+                    slots=self._extract_seat_action_slots(text, state) or {},
                     reference_text=text,
                 )
             if self._is_price_query_text(text):
@@ -735,7 +829,7 @@ class LLMNLU:
             # (placed after _is_showtime_search_text so "场次" etc. take priority)
             if self._is_movie_view_request(text):
                 movie_name = self._extract_movie_name(text)
-                if movie_name and movie_name not in {"喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}:
+                if movie_name and not is_genre_phrase(movie_name):
                     slots = self._extract_booking_slots(text, payload)
                     slots["movieName"] = movie_name
                     self._apply_nearby_showtime_preferences(text, slots)
@@ -800,7 +894,7 @@ class LLMNLU:
                     "location", "ticketCount", "movieName", "cinemaName",
                     "hallName", "hallType", "language", "date", "time",
                     "startAt", "endAt", "endTime", "price", "remainingSeats",
-                    "seatPreference", "seatPositions", "snackRequests",
+                    "seatPreference", "seatType", "seatPositions", "snackRequests",
                 ]:
                     if key in payload and payload[key] not in [None, ""]:
                         slots[key] = payload[key]
@@ -907,7 +1001,7 @@ class LLMNLU:
         # (placed after _is_showtime_search_text so "场次" etc. take priority)
         if self._is_movie_view_request(text):
             movie_name = self._extract_movie_name(text)
-            if movie_name and movie_name not in {"喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}:
+            if movie_name and not is_genre_phrase(movie_name):
                 slots = self._extract_booking_slots(text, payload)
                 slots["movieName"] = movie_name
                 self._apply_nearby_showtime_preferences(text, slots)
@@ -991,17 +1085,21 @@ class LLMNLU:
             rag_candidates=rag_candidates,
         )
 
-    @staticmethod
-    def _try_fill_pending_slot(text: str, state: "AgentState") -> NLUResult | None:
+    def _try_fill_pending_slot(self, text: str, state: "AgentState") -> NLUResult | None:
         """When the system is actively waiting for a slot, try short-text matching
         before calling the LLM.  Only fires on short (<20 char) inputs without
         payload data — longer messages still go to the LLM."""
         if len(text) > 20:
             return None
         pending = state.pending_action
+        collecting_slot = (
+            state.state.removeprefix("collecting_")
+            if state.state.startswith("collecting_")
+            else ""
+        )
 
         # ── Waiting for time/date ──
-        if pending == "ask_time":
+        if pending == "ask_time" or collecting_slot in {"date", "timeRange"}:
             trimmed = text.strip()
             date_map = {
                 "今天": "today", "今晚": "today", "today": "today",
@@ -1017,6 +1115,7 @@ class LLMNLU:
             time_val = time_range_map.get(trimmed)
             any_time = trimmed in ("随便", "都行", "不限", "无所谓", "什么时候都行", "都可以", "任意")
             time_match = re.match(r"^(\d{1,2})[:：点](\d{0,2})?$", trimmed)
+            extracted_time = self._extract_time_range(trimmed)
 
             if any_time:
                 return NLUResult(intent="book_ticket", confidence=0.92, intent_source="rule",
@@ -1027,6 +1126,9 @@ class LLMNLU:
             if time_val:
                 return NLUResult(intent="book_ticket", confidence=0.95, intent_source="rule",
                                  slots={"timeRange": time_val})
+            if extracted_time:
+                return NLUResult(intent="book_ticket", confidence=0.95, intent_source="rule",
+                                 slots={"timeRange": extracted_time})
             if time_match:
                 hour = int(time_match.group(1))
                 minute = int(time_match.group(2) or 0)
@@ -1035,25 +1137,122 @@ class LLMNLU:
                                      slots={"timeRange": f"{hour:02d}:{minute:02d}"})
 
         # ── Waiting for ticket count ──
-        if pending == "ask_ticket_count":
+        if pending == "ask_ticket_count" or collecting_slot == "ticketCount":
             trimmed = text.strip()
             if trimmed in ("随便", "都行", "不限", "都可以", "无所谓"):
                 return NLUResult(intent="book_ticket", confidence=0.90, intent_source="rule")
-            num_match = re.match(r"^(\d+|[一二两三四五六七八九十])$", trimmed)
-            if num_match:
-                chinese_num = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-                               "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-                val = num_match.group(1)
-                count = int(val) if val.isdigit() else chinese_num.get(val, 2)
+            count = self._extract_ticket_count(trimmed)
+            if count is None:
+                num_match = re.match(
+                    r"^(\d+|[一二两三四五六七八九十])(?:张|个人|人)?$",
+                    trimmed,
+                )
+                if num_match:
+                    val = num_match.group(1)
+                    count = int(val) if val.isdigit() else self._parse_number_token(val)
+            if count is not None:
                 return NLUResult(intent="book_ticket", confidence=0.95, intent_source="rule",
                                  slots={"ticketCount": count})
 
+        if collecting_slot == "cinemaName":
+            normalized = _normalize_short_text(text)
+            if any(word in normalized for word in ["附近", "最近", "离我近", "就近"]):
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.93,
+                    intent_source="rule",
+                    slots={"nearbyFirst": True, "cinemaLimit": 5},
+                    reference_text=text,
+                )
+            cinema_name = self._extract_cinema_name(text) or text.strip()
+            if cinema_name and cinema_name not in {"随便", "都行", "不限", "都可以", "无所谓"}:
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.93,
+                    intent_source="rule",
+                    slots={"cinemaName": cinema_name},
+                    reference_text=text,
+                )
+
+        if collecting_slot == "seatPreference":
+            slots = self._extract_seat_preference_slots(text)
+            seat_type = self._extract_seat_type(text)
+            if seat_type:
+                slots["seatType"] = seat_type
+                slots.setdefault("autoSelectSeats", True)
+                slots.setdefault("seatPreference", "middle")
+            if not slots and text.strip() in ("随便", "都行", "不限", "都可以", "无所谓"):
+                slots = {"autoSelectSeats": True, "seatPreference": "middle"}
+            if slots:
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.93,
+                    intent_source="rule",
+                    slots=slots,
+                    reference_text=text,
+                )
+
         # ── Waiting for movie/genre ──
-        if pending == "ask_movie_or_genre":
+        if pending == "ask_movie_or_genre" or collecting_slot in {"movieName", "genre"}:
             if text.strip() in ("随便", "都行", "不限", "都可以", "无所谓", "什么都行"):
                 return NLUResult(intent="search_movies", confidence=0.88, intent_source="rule",
                                  slots={})
+            genre = self._extract_genre(text)
+            if genre and collecting_slot == "genre":
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.94,
+                    intent_source="rule",
+                    slots={"genre": genre},
+                    reference_text=text,
+                )
+            movie_name = self._extract_movie_name(text)
+            if collecting_slot == "movieName" and movie_name:
+                return NLUResult(
+                    intent="book_ticket",
+                    confidence=0.94,
+                    intent_source="rule",
+                    slots={"movieName": movie_name},
+                    reference_text=text,
+                )
 
+        return None
+
+    def _try_contextual_ack(
+        self,
+        text: str,
+        state: AgentState | None,
+    ) -> NLUResult | None:
+        if not state or not is_ack_text(text):
+            return None
+        last_message = _normalize_short_text(state.last_bot_message)
+        if not last_message:
+            return None
+        if (
+            "要不要看看现在有哪些电影正在上映" in last_message
+            or "看看现在有哪些电影正在上映" in last_message
+            or "现在有哪些电影正在上映" in last_message
+        ):
+            return NLUResult(
+                intent="search_movies",
+                confidence=0.96,
+                intent_source="rule",
+                slots={
+                    "date": "today",
+                    "recommendationCriteria": "hot",
+                    "movieLimit": 3,
+                    "__clearSlots": [
+                        "genre",
+                        "movieName",
+                        "movieId",
+                        "recommendationCriteria",
+                        "showtimeId",
+                        "seatIds",
+                        "seatPositions",
+                    ],
+                },
+                reference_text=text,
+            )
         return None
 
     def _llm_extract(
@@ -1162,10 +1361,14 @@ class LLMNLU:
                 "timeRange",
                 "ticketCount",
                 "seatPositions",
+                "seatType",
+                "seatPreference",
+                "autoSelectSeats",
                 "cinemaName",
                 "cinemaId",
                 "location",
                 "hallType",
+                "maxPrice",
             ]:
                 if key in rule_candidate.slots:
                     llm_slots[key] = rule_candidate.slots[key]
@@ -1373,6 +1576,20 @@ class LLMNLU:
         if seat_positions:
             slots["seatPositions"] = seat_positions
 
+        seat_type = self._extract_seat_type(text)
+        if seat_type:
+            slots["seatType"] = seat_type
+            if seat_type == "couple" and ticket_count is None:
+                ticket_count = 2
+                slots["ticketCount"] = 2
+
+        seat_preference_slots = self._extract_seat_preference_slots(text)
+        if seat_preference_slots:
+            slots.update(seat_preference_slots)
+        elif seat_type:
+            slots["autoSelectSeats"] = True
+            slots.setdefault("seatPreference", "middle")
+
         genre = self._extract_genre(text)
         if genre:
             slots["genre"] = genre
@@ -1380,6 +1597,10 @@ class LLMNLU:
         snack_requests = self._extract_snack_requests(text)
         if snack_requests:
             slots["snackRequests"] = snack_requests
+
+        max_price = self._extract_max_price(text, ticket_count)
+        if max_price is not None:
+            slots["maxPrice"] = max_price
 
         cinema_name = self._extract_cinema_name(text)
         if cinema_name:
@@ -1410,6 +1631,26 @@ class LLMNLU:
             slots["skipSnacks"] = True
 
         return slots
+
+    def _is_deterministic_booking_text(self, text: str) -> bool:
+        normalized = _normalize_short_text(text)
+        if not any(word in normalized for word in ["买", "订", "预订", "电影票", "影票", "票"]):
+            return False
+        slots = self._extract_booking_slots(text, {})
+        strong_slot_count = sum(
+            1
+            for key in [
+                "movieName",
+                "cinemaName",
+                "date",
+                "timeRange",
+                "ticketCount",
+                "hallType",
+                "maxPrice",
+            ]
+            if slots.get(key) not in [None, ""]
+        )
+        return strong_slot_count >= 2
 
     @staticmethod
     def _wants_auto_showtime(text: str) -> bool:
@@ -1466,21 +1707,129 @@ class LLMNLU:
                 positions.append(position)
         return positions
 
+    @staticmethod
+    def _extract_seat_type(text: str) -> str:
+        normalized = _normalize_short_text(text)
+        if any(word in normalized for word in ["情侣座", "情侣厅", "双人座"]):
+            return "couple"
+        if any(word in normalized for word in ["普通座", "普通票", "普通位", "普通座位"]):
+            return "standard"
+        return ""
+
     def _extract_ticket_count(self, text: str) -> int | None:
         normalized = re.sub(r"\s+", "", text)
         match = re.search(r"(?P<count>[0-9一二两三四五六七八九十]+)\s*(?:张|份|个)?(?:电影票|影票|票)", normalized)
         if not match:
             match = re.search(
                 r"(?P<count>[0-9一二两三四五六七八九十]+)张"
-                r"(?=(?:的)?(?:电影|影片|片|喜剧|爱情|动作|科幻|动画|悬疑|恐怖))",
+                rf"(?=(?:的)?(?:电影|影片|片|{GENRE_TERMS_PATTERN}))",
                 normalized,
             )
         if not match:
             match = re.search(r"(?:买|订|要|来)(?P<count>[0-9一二两三四五六七八九十]+)张", normalized)
         if not match:
+            match = re.search(
+                r"(?P<count>[0-9一二两三四五六七八九十]+)张(?:普通座|座位)",
+                normalized,
+            )
+        if not match:
+            match = re.search(
+                r"(?P<count>[0-9一二两三四五六七八九十]+)(?:个|张)?"
+                r"(?:情侣座|情侣厅|双人座|普通座|普通位|普通座位|座位)",
+                normalized,
+            )
+        if not match:
+            match = re.search(
+                r"(?P<count>[0-9一二两三四五六七八九十]+)(?:个)?人",
+                normalized,
+            )
+        if not match:
             return None
         count = self._parse_number_token(match.group("count"))
         return count if count and count > 0 else None
+
+    def _extract_seat_action_slots(
+        self,
+        text: str,
+        state: AgentState | None = None,
+    ) -> dict[str, Any] | None:
+        normalized = _normalize_short_text(text)
+        has_seat_word = any(
+            word in normalized
+            for word in ["座位", "选座", "位置", "座", "观影区", "观影"]
+        )
+        has_seat_action = any(
+            word in normalized
+            for word in ["换", "改", "重新", "重选", "选", "坐", "安排", "帮我选", "给我选"]
+        )
+        if not has_seat_word or not has_seat_action:
+            return None
+
+        slots = self._extract_seat_preference_slots(text)
+        seat_type = self._extract_seat_type(text)
+        if seat_type:
+            slots["seatType"] = seat_type
+            slots.setdefault("autoSelectSeats", True)
+            slots.setdefault("seatPreference", "middle")
+
+        count = self._extract_ticket_count(text)
+        if count is not None:
+            slots["ticketCount"] = count
+        elif seat_type == "couple":
+            current_count = self._parse_number_token(
+                str((state.slots or {}).get("ticketCount"))
+            ) if state else None
+            slots["ticketCount"] = current_count if current_count and current_count % 2 == 0 else 2
+
+        if is_text_auto_seat_or_auto_purchase(text):
+            slots["autoSelectSeats"] = True
+            slots.setdefault("seatPreference", _auto_seat_preference(text))
+
+        if not slots and is_change_seat_text(text):
+            return {}
+        return slots or None
+
+    def _extract_max_price(self, text: str, ticket_count: int | None = None) -> float | None:
+        normalized = re.sub(r"\s+", "", text)
+
+        per_person = re.search(
+            r"(?:预算)?(?:每人|每张|单张|一张|人均)(?:不超过|不超|以内|低于|小于|不高于|最多|最高)?"
+            r"(?P<amount>\d+(?:\.\d+)?|[一二两三四五六七八九十百]+)(?:元|块|块钱)",
+            normalized,
+        )
+        if not per_person:
+            per_person = re.search(
+                r"(?P<amount>\d+(?:\.\d+)?|[一二两三四五六七八九十百]+)(?:元|块|块钱)"
+                r"(?:以内|以下|内|每人|每张|单张|一张|人均)",
+                normalized,
+            )
+        if per_person:
+            return self._parse_price_amount(per_person.group("amount"))
+
+        total = re.search(
+            r"(?:预算|一共|总共|总价|合计)(?:不超过|不超|以内|低于|小于|不高于|最多|最高)?"
+            r"(?P<amount>\d+(?:\.\d+)?|[一二两三四五六七八九十百]+)(?:元|块|块钱)",
+            normalized,
+        )
+        if total:
+            amount = self._parse_price_amount(total.group("amount"))
+            if amount is None:
+                return None
+            if ticket_count and ticket_count > 0:
+                return round(amount / ticket_count, 2)
+            return amount
+
+        return None
+
+    def _parse_price_amount(self, value: str) -> float | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            parsed = self._parse_number_token(text)
+            return float(parsed) if parsed is not None else None
 
     def _extract_date(self, text: str) -> str | None:
         explicit_date = self._extract_explicit_month_day(text)
@@ -1522,14 +1871,30 @@ class LLMNLU:
         return parsed.isoformat()
 
     def _extract_time_range(self, text: str) -> str | None:
-        normalized = re.sub(r"\s+", "", text)
-        period_match = re.search(r"(上午|早上|中午|下午|晚上|今晚|明晚)?([0-9一二两三四五六七八九十]{1,3})(?:[:：点])([0-9一二两三四五六七八九十]{0,2})?(半)?", normalized)
+        text_without_titles = re.sub(r"[《【][^》】]+[》】]", "", text)
+        normalized = re.sub(r"\s+", "", text_without_titles)
+        period_match = re.search(
+            r"(上午|早上|中午|下午|晚上|今晚|明晚)"
+            r"([0-9一二两三四五六七八九十]{1,3})(?:[:：点])"
+            r"([0-9一二两三四五六七八九十]{0,2})?(半)?",
+            normalized,
+        )
+        if not period_match:
+            period_match = re.search(
+                r"(?<![A-Za-z0-9\u4e00-\u9fff])"
+                r"([0-9一二两三四五六七八九十]{1,3})(?:点)"
+                r"([0-9一二两三四五六七八九十]{0,2})?(半)?",
+                normalized,
+            )
         if period_match:
-            period = period_match.group(1) or ""
-            hour = self._parse_number_token(period_match.group(2))
-            minute_text = period_match.group(3)
+            period = period_match.group(1) or "" if len(period_match.groups()) == 4 else ""
+            hour_group_index = 2 if len(period_match.groups()) == 4 else 1
+            minute_group_index = 3 if len(period_match.groups()) == 4 else 2
+            half_group_index = 4 if len(period_match.groups()) == 4 else 3
+            hour = self._parse_number_token(period_match.group(hour_group_index))
+            minute_text = period_match.group(minute_group_index)
             minute = self._parse_number_token(minute_text) if minute_text else 0
-            if period_match.group(4):
+            if period_match.group(half_group_index):
                 minute = 30
             if hour is not None and minute is not None:
                 if period in {"下午", "晚上", "今晚", "明晚"} and 1 <= hour < 12:
@@ -1548,10 +1913,7 @@ class LLMNLU:
         return None
 
     def _extract_genre(self, text: str) -> str | None:
-        for genre in ["喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"]:
-            if genre in text:
-                return genre
-        return None
+        return canonical_genre_from_text(text)
 
     def _should_clear_stale_showtime_constraints(self, text: str) -> bool:
         normalized = _normalize_short_text(text)
@@ -1621,6 +1983,9 @@ class LLMNLU:
         cleaned = re.sub(r"\s+", "", text)
         if cinema_name:
             cleaned = cleaned.replace(cinema_name, "")
+        quoted = re.search(r"[《【](?P<name>[^》】]+)[》】]", cleaned)
+        if quoted:
+            return quoted.group("name").strip()
         if snack_requests:
             snack_names = r"爆米花|可乐|薯条|热狗|饮料|套餐"
             cleaned = re.sub(
@@ -1635,12 +2000,24 @@ class LLMNLU:
             "",
             cleaned,
         )
+        cleaned = self._strip_booking_modifier_clauses(cleaned)
         marker_match = re.search(r"(?P<name>.+?)(?:电影票|影票)", cleaned)
         if marker_match:
             candidate = self._clean_movie_candidate(marker_match.group("name"))
             if cinema_name:
                 candidate = self._clean_movie_candidate(candidate.replace(cinema_name, ""))
             if candidate:
+                return candidate
+
+        for pattern in [
+            r"(?:买|订|预订|要|来)(?:[0-9一二两三四五六七八九十]+张)?(?P<name>[^，,。；;]+?)(?:的)?(?:电影票|影票|票|普通座|座位|IMAX厅|杜比厅|巨幕厅|数字厅|$)",
+            r"(?:看|观看)(?P<name>[^，,。；;]+?)(?:的)?(?:场次|排片|电影票|影票|票)",
+        ]:
+            match = re.search(pattern, cleaned)
+            if not match:
+                continue
+            candidate = self._clean_movie_candidate(match.group("name"))
+            if candidate and candidate not in {"普通座", "座位", "票"}:
                 return candidate
 
         cleaned = re.split(
@@ -1662,21 +2039,59 @@ class LLMNLU:
             cleaned,
         )
         cleaned = self._clean_movie_candidate(cleaned)
-        if cleaned in {"", "片", "部片", "一部片", "喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"}:
+        if cleaned in {"", "片", "部片", "一部片"} or is_genre_phrase(cleaned):
             return ""
+        return cleaned
+
+    @staticmethod
+    def _strip_seat_preference_clause(text: str) -> str:
+        preference = (
+            r"最佳观影区|黄金观影区|最佳观影|黄金位置|好位置|"
+            r"中间(?:的)?(?:座位|位置)?|靠中间(?:的)?(?:座位|位置)?|"
+            r"居中(?:的)?(?:座位|位置)?|中部(?:的)?(?:座位|位置)?|"
+            r"正中(?:的)?(?:座位|位置)?|中央(?:的)?(?:座位|位置)?|"
+            r"前排(?:座位)?|靠前(?:的)?(?:座位|位置)?|"
+            r"后排(?:座位)?|靠后(?:的)?(?:座位|位置)?"
+        )
+        return re.sub(
+            rf"(?:[，,。；;、]|^)?(?:我想要|想要|我要|要|选|坐|安排)?(?:{preference})(?:的)?$",
+            "",
+            text,
+        )
+
+    @classmethod
+    def _strip_booking_modifier_clauses(cls, text: str) -> str:
+        cleaned = cls._strip_seat_preference_clause(text)
+        hall = (
+            r"IMAX厅|IMAX影厅|IMAX|MAX厅|MAX影厅|杜比厅|杜比影厅|杜比|"
+            r"巨幕厅|巨幕影厅|巨幕|激光厅|激光影厅|激光|"
+            r"4DX厅|4DX影厅|4DX|MX4D厅|MX4D影厅|MX4D|数字厅|数字影厅"
+        )
+        seat_type = r"情侣座|情侣厅|双人座|普通座|普通票|普通位|普通座位"
+        modifier = rf"(?:{hall}|{seat_type})"
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            cleaned = re.sub(
+                rf"(?:[，,。；;、]|^)?(?:我想要|想要|我要|要|选|坐|安排)?(?:{modifier})(?:的)?$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = cls._strip_seat_preference_clause(cleaned)
         return cleaned
 
     def _extract_cinema_name(self, text: str) -> str:
         normalized = re.sub(r"\s+", "", text)
         suffix = r"(?:电影院|影城|影院)"
-        branch = r"(?:[（(][^）)]{1,20}[）)])?"
+        branch = r"(?:(?:[（(][^）)]{1,20}[）)])|(?:[A-Za-z0-9\u4e00-\u9fff·_-]{1,12}店))?"
         known_brands = (
             "CGV|万达|大地|奥斯卡|博纳|金逸|中影|横店|UME|卢米埃|"
             "保利|橙天嘉禾|星美|幸福蓝海"
         )
         patterns = (
             re.compile(
-                rf"(?P<name>(?:{known_brands})"
+                rf"(?P<name>(?:[A-Za-z\u4e00-\u9fff]{{0,8}})?(?:{known_brands})"
                 rf"[A-Za-z0-9\u4e00-\u9fff·_-]{{0,12}}{suffix}{branch})(?:的)?",
                 re.IGNORECASE,
             ),
@@ -1726,6 +2141,8 @@ class LLMNLU:
         normalized = re.sub(r"\s+", "", text).upper()
         for marker, hall_type in [
             ("IMAX", "IMAX"),
+            ("MAX厅", "IMAX"),
+            ("MAX影厅", "IMAX"),
             ("DOLBY", "杜比"),
             ("杜比", "杜比"),
             ("4DX", "4DX"),
@@ -1739,6 +2156,14 @@ class LLMNLU:
     def _extract_hall_type_showtime_slots(self, text: str) -> dict[str, Any]:
         hall_type = self._extract_hall_type(text)
         if not hall_type:
+            return {}
+        if (
+            self._extract_date(text)
+            or self._extract_time_range(text)
+            or self._extract_ticket_count(text) is not None
+            or self._extract_max_price(text) is not None
+            or self._extract_cinema_name(text)
+        ):
             return {}
 
         normalized = _normalize_short_text(text)
@@ -1772,7 +2197,18 @@ class LLMNLU:
             "",
             cleaned,
         )
-        cleaned = re.sub(r"^(给我|帮我|我要|我想|想要|请帮我|麻烦帮我|买|订|预订|来|看|想看|去看)+", "", cleaned)
+        cleaned = re.sub(r"^(在|我看看|看看|给我|帮我|我要|我想|想要|请帮我|麻烦帮我|买|订|预订|来|看|想看|去看)+", "", cleaned)
+        cleaned = re.sub(r"^[0-9一二两三四五六七八九十]+张(?:电影票|影票|票)?", "", cleaned)
+        cleaned = re.sub(r"^(?:点|:|：)+", "", cleaned)
+        brand_match = re.search(
+            r"(CGV|万达|大地|奥斯卡|博纳|金逸|中影|横店|UME|卢米埃|保利|橙天嘉禾|星美|幸福蓝海)",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if brand_match and brand_match.start() > 0:
+            prefix = cleaned[:brand_match.start()]
+            if len(prefix) > 2 and not prefix.endswith(("市", "区", "县")):
+                cleaned = cleaned[brand_match.start():]
         cleaned = cleaned.strip("的《》<>【】[]，,。.!?！？：:")
         return cleaned
 
@@ -1840,6 +2276,8 @@ class LLMNLU:
             cleaned,
         )
         cleaned = re.sub(r"^(上午|早上|中午|下午|晚上)+", "", cleaned)
+        cleaned = cleaned.strip("的《》<>【】[]()，,。.!?！？：:")
+        cleaned = re.sub(r"[，,。；;、]?(?:在|于)$", "", cleaned)
         cleaned = cleaned.strip("的《》<>【】[]()，,。.!?！？：:")
         cleaned = re.sub(r"(电影票|影票|电影|影片|票)+$", "", cleaned)
         cleaned = cleaned.strip("的《》<>【】[]()，,。.!?！？：:")
@@ -2080,6 +2518,143 @@ class LLMNLU:
             slots["timePreference"] = "earliest"
             slots["showtimeLimit"] = 1
 
+    def _no_showtime_followup_slots(
+        self,
+        text: str,
+        state: AgentState | None,
+    ) -> dict[str, Any] | None:
+        if state is None:
+            return None
+        if (
+            state.slots.get("movieId") in [None, ""]
+            and state.slots.get("movieName") in [None, ""]
+            and state.slots.get("genre") in [None, ""]
+        ):
+            return None
+        if not self._is_no_showtime_context(state):
+            return None
+
+        normalized = _normalize_short_text(text)
+        wants_time_relax = any(
+            phrase in normalized
+            for phrase in [
+                "有什么场次",
+                "有哪些场次",
+                "还有什么场次",
+                "其他场次",
+                "其它场次",
+                "别的场次",
+                "换个时间",
+                "换时间",
+                "其他时间",
+                "其它时间",
+                "别的时间",
+                "还有什么时间",
+                "还有哪些时间",
+            ]
+        )
+        wants_type_relax = any(
+            phrase in normalized
+            for phrase in [
+                "换个类型",
+                "换类型",
+                "其他类型",
+                "其它类型",
+                "别的类型",
+                "换个厅",
+                "换厅",
+                "普通厅",
+                "普通影厅",
+                "普通场",
+            ]
+        )
+        new_time = self._extract_time_range(text)
+        new_hall_type = self._extract_hall_type(text)
+        if not (wants_time_relax or wants_type_relax or new_time or new_hall_type):
+            return None
+
+        clear_slots = [
+            "showtimeId",
+            "seatIds",
+            "seatPositions",
+            "orderId",
+            "lockId",
+            "couponId",
+            "snackIds",
+            "snackItems",
+            "snackRequests",
+            "price",
+            "amount",
+            "status",
+            "expiresAt",
+        ]
+        if wants_time_relax and not new_time:
+            clear_slots.extend(["timeRange", "time", "startAt", "endAt", "timePreference"])
+        if wants_type_relax and not new_hall_type:
+            clear_slots.extend(["hallType", "notHallType"])
+
+        slots: dict[str, Any] = {"__clearSlots": clear_slots}
+        skip_keys = set(clear_slots) | {"__clearSlots"}
+        for key in [
+            "movieId",
+            "movieName",
+            "genre",
+            "date",
+            "timeRange",
+            "ticketCount",
+            "cinemaId",
+            "cinemaName",
+            "hallType",
+            "notHallType",
+            "maxPrice",
+            "pricePreference",
+            "seatPreference",
+            "seatType",
+            "autoSelectShowtime",
+            "autoSelectSeats",
+            "skipSnacks",
+            "location",
+            "nearbyFirst",
+        ]:
+            if key not in skip_keys and state.slots.get(key) not in [None, ""]:
+                slots[key] = state.slots[key]
+
+        date_value = self._extract_date(text)
+        if date_value:
+            slots["date"] = date_value
+        if new_time:
+            slots["timeRange"] = new_time
+            slots.pop("timePreference", None)
+        ticket_count = self._extract_ticket_count(text)
+        if ticket_count is not None:
+            slots["ticketCount"] = ticket_count
+        cinema_name = self._extract_cinema_name(text)
+        if cinema_name:
+            slots["cinemaName"] = cinema_name
+        if new_hall_type:
+            slots["hallType"] = new_hall_type
+        slots.update(self._extract_seat_preference_slots(text))
+        return slots
+
+    @staticmethod
+    def _is_no_showtime_context(state: AgentState) -> bool:
+        last_bot_message = _normalize_short_text(state.last_bot_message or "")
+        if any(
+            phrase in last_bot_message
+            for phrase in [
+                "没有找到合适的场次",
+                "没找到合适的场次",
+                "暂无合适场次",
+                "没有可选场次",
+                "暂无可选场次",
+            ]
+        ):
+            return True
+        if state.pending_action != "search_showtimes":
+            return False
+        candidates = state.selected.get("showtime_candidates")
+        return isinstance(candidates, list) and not candidates
+
     @staticmethod
     def _is_other_cinema_showtime_followup(text: str, state: AgentState) -> bool:
         if state.slots.get("movieId") in [None, ""] and state.slots.get("movieName") in [None, ""]:
@@ -2138,6 +2713,10 @@ class LLMNLU:
             "timeRange",
             "ticketCount",
             "hallType",
+            "maxPrice",
+            "seatPreference",
+            "seatType",
+            "autoSelectSeats",
             "location",
             "nearbyFirst",
         ]:
@@ -2215,7 +2794,21 @@ class LLMNLU:
             }
         if any(
             phrase in normalized
-            for phrase in ["中间", "靠中间", "居中", "中部"]
+            for phrase in [
+                "最佳观影区",
+                "黄金观影区",
+                "最佳观影",
+                "黄金位置",
+                "好位置",
+            ]
+        ):
+            return {
+                "autoSelectSeats": True,
+                "seatPreference": "best",
+            }
+        if any(
+            phrase in normalized
+            for phrase in ["中间", "靠中间", "居中", "中部", "正中", "中央"]
         ):
             return {
                 "autoSelectSeats": True,
@@ -2365,11 +2958,14 @@ class LLMNLU:
                 "cinemaId",
                 "cinemaName",
                 "hallType",
+                "maxPrice",
                 "pricePreference",
                 "recommendationCriteria",
                 "showtimeId",
                 "seatIds",
                 "seatPositions",
+                "seatPreference",
+                "seatType",
                 "orderId",
                 "lockId",
                 "snackIds",
@@ -2428,6 +3024,15 @@ class LLMNLU:
         quoted = re.search(r"[《【](?P<name>[^》】]+)[》】]", normalized)
         if quoted:
             return quoted.group("name").strip()
+
+        watch_context = re.search(
+            r".*(?:看|观看)(?P<name>[^，,。；;]+?)(?:的)?(?:场次|排片)",
+            normalized,
+        )
+        if watch_context:
+            candidate = watch_context.group("name").strip("的《》<>【】[]()，,。.!?！？：: ")
+            if candidate:
+                return candidate
 
         direct = re.search(
             r"(?P<name>.+?)"
@@ -2584,10 +3189,7 @@ class LLMNLU:
         has_ticket_count = bool(
             re.search(r"[0-9一二两三四五六七八九十]+张", normalized)
         )
-        has_genre = any(
-            genre in normalized
-            for genre in ["喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "恐怖"]
-        )
+        has_genre = bool(canonical_genre_from_text(normalized))
         return has_date and has_ticket_count and has_genre
 
     @staticmethod
